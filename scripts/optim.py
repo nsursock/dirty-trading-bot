@@ -79,7 +79,7 @@ def _objective(cfg, timesteps, spec, pruner_cb=True):
 
         j = JointHRL(cfg2)
         j.learn(total_timesteps=timesteps, log_interval=10_000_000, on_iter=on_iter)
-        m = metrics(run_test(cfg2, j.manager, j.worker)["net"])
+        m = metrics(run_test(cfg2, j.manager, j.worker, norm_state=j.worker_env.norm_state)["net"])
         value = m.get("sharpe", m.get("sortino", m.get("total_return", -1e9)))
         log.info("optuna: trial value=%.4f metrics=%s", value, m)
         return value

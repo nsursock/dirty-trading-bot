@@ -88,7 +88,8 @@ def _latest_checkpoint() -> Path | None:
 
 
 def _test(cfg, run_dir: Path, j: JointHRL) -> dict:
-    return generate_report(cfg, j.manager, j.worker, run_dir / "testing")
+    return generate_report(cfg, j.manager, j.worker, run_dir / "testing",
+                           norm_state=j.worker_env.norm_state)
 
 
 def main():

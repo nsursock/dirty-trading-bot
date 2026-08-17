@@ -39,13 +39,17 @@ class TradingEnv:
         *,
         action_space: str = "discrete",
         n_envs_per_symbol: int = 8,
-        leverage: float = 5.0,
+        lev_min: float = 2.0,
+        lev_max: float = 20.0,
         fee_rate: float = 5e-4,
         slippage_bps: float = 1.0,
         funding_rate: float = 1e-4,
         maintenance_margin_rate: float = 5e-3,
         liquidation_fee_rate: float = 1e-2,
         min_collateral: float = 10.0,
+        max_collateral: float = 10_000.0,
+        risk_min: float = 0.01,
+        risk_max: float = 0.05,
         initial_balance: float = 1000.0,
         size_fraction: float = 1.0,
         side_threshold: float = 0.2,
@@ -55,6 +59,7 @@ class TradingEnv:
         reward_clip: float = 10.0,
         goal_dim: int = 0,
         eval_every: int = 32,
+        enforce_goal: bool = False,
         seed: int = 0,
     ):
         features = mx.array(features, dtype=mx.float32)
@@ -75,13 +80,17 @@ class TradingEnv:
 
         self.discrete = action_space == "discrete"
         self.goal_dim = int(goal_dim)
-        self.leverage = float(leverage)
+        self.lev_min = float(lev_min)
+        self.lev_max = float(lev_max)
         self.fee_rate = float(fee_rate)
         self.slip = float(slippage_bps) / 1e4
         self.funding_rate = float(funding_rate)
         self.maintenance_margin_rate = float(maintenance_margin_rate)
         self.liquidation_fee_rate = float(liquidation_fee_rate)
         self.min_collateral = float(min_collateral)
+        self.max_collateral = float(max_collateral)
+        self.risk_min = float(risk_min)
+        self.risk_max = float(risk_max)
         self.initial_balance = float(initial_balance)
         self.size_fraction = float(size_fraction)
         self.side_threshold = float(side_threshold)
@@ -90,6 +99,7 @@ class TradingEnv:
         self.drawdown_penalty = float(drawdown_penalty)
         self.reward_clip = float(reward_clip)
         self.eval_every = max(int(eval_every), 1)
+        self.enforce_goal = bool(enforce_goal)
         self._step_count = 0
 
         obs_dim = self.F + 6 + self.goal_dim
@@ -175,13 +185,17 @@ class TradingEnv:
         sym_off = self.sym_off
         goal_dim = self.goal_dim
         discrete = self.discrete
-        leverage = self.leverage
+        lev_min = self.lev_min
+        lev_max = self.lev_max
         fee_rate = self.fee_rate
         slip = self.slip
         funding = self.funding_rate
         maint = self.maintenance_margin_rate
         liq_fee = self.liquidation_fee_rate
         min_col = self.min_collateral
+        max_coll = self.max_collateral
+        risk_min = self.risk_min
+        risk_max = self.risk_max
         init_bal = self.initial_balance
         size_frac = self.size_fraction
         side_thr = self.side_threshold
@@ -189,6 +203,7 @@ class TradingEnv:
         reward_mode = self.reward_mode
         dd_penalty = self.drawdown_penalty
         reward_clip = self.reward_clip
+        enforce_goal = self.enforce_goal
 
         feats0 = mx.take(feats2d, sym_off, axis=0)
         pos0 = mx.concatenate([mx.ones((num_envs, 1)), mx.zeros((num_envs, 2))], axis=1)
@@ -233,14 +248,21 @@ class TradingEnv:
             if discrete:
                 a = action.astype(mx.float32)
                 side = mx.where(a == 1.0, 1.0, mx.where(a == 2.0, -1.0, 0.0))
-                lev_frac = mx.full((num_envs,), size_frac)
+                t = mx.full((num_envs,), size_frac)
             else:
                 a = mx.clip(mx.reshape(action.astype(mx.float32), (num_envs,)), -1.0, 1.0)
                 eff_thr = side_thr / trade_knob
                 side = mx.where(mx.abs(a) > eff_thr, mx.sign(a), 0.0)
-                lev_frac = mx.maximum(mx.abs(a), 0.05)
+                t = mx.abs(a)
 
             side = mx.where(liq, 0.0, side)
+
+            if goal_dim >= 3 and enforce_goal:
+                goal = state[:, 5:]
+                g_flat, g_long, g_short = goal[:, 0], goal[:, 1], goal[:, 2]
+                side = mx.where(g_long, mx.maximum(side, 0.0), side)
+                side = mx.where(g_short, mx.minimum(side, 0.0), side)
+                side = mx.where(g_flat, 0.0, side)
 
             side_cur = mx.sign(q)
             close = (mx.abs(q) > EPS) & (side_cur != side)
@@ -254,13 +276,13 @@ class TradingEnv:
             collateral = mx.where(close, 0.0, collateral)
 
             open_pos = (side != 0.0) & (mx.abs(q) <= EPS)
-            avail = mx.maximum(balance, 0.0)
-            lev_used = leverage * lev_frac
-            notional_new = avail * lev_used
+            risk_frac = risk_min + t * (risk_max - risk_min)
+            lev_used = lev_min + t * (lev_max - lev_min)
+            collateral_new = mx.clip(risk_frac * balance, min_col, max_coll)
+            notional_new = collateral_new * lev_used
             fee_open = fee_rate * notional_new
-            collateral_new = notional_new / lev_used - fee_open
             fill = price * (1.0 + side * slip)
-            balance = mx.where(open_pos, balance - notional_new / lev_used, balance)
+            balance = mx.where(open_pos, balance - collateral_new - fee_open, balance)
             collateral = mx.where(open_pos, collateral_new, collateral)
             q = mx.where(open_pos, side * notional_new / (fill + EPS), q)
             entry = mx.where(open_pos, fill, entry)

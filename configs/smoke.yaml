@@ -7,13 +7,18 @@ data:
 
 env:
   n_envs_per_symbol: 4
-  leverage: 5.0
+  lev_min: 2.0
+  lev_max: 20.0
   fee_rate: 0.0005
   slippage_bps: 1.0
   funding_rate: 0.0001
   maintenance_margin_rate: 0.005
   liquidation_fee_rate: 0.01
   min_collateral: 10.0
+  max_collateral: 10000.0
+  risk_min: 0.01
+  risk_max: 0.05
+  enforce_goal: false
   initial_balance: 1000.0
   size_fraction: 1.0
   side_threshold: 0.2
@@ -25,7 +30,7 @@ reward:
   reward_clip: 10.0
 
 report:
-  theme: ghibli
+  theme: synthwave
 
 train:
   total_timesteps: 4096

@@ -74,11 +74,18 @@ def _finish_trade(tr, exit_price, exit_step, exit_type, fee, realized):
     return tr
 
 
-def run_test(cfg, manager, worker) -> dict:
+def run_test(cfg, manager, worker, norm_state=None) -> dict:
     """Deterministic joint rollout -> ledger + per-step series."""
     import mlx.core as mx
+    from dirty_mlx_ml.reinforcement import VecNormalize
 
     env, symbols, e = _test_env(cfg)
+    if norm_state is not None:
+        env = VecNormalize(env, norm_obs=True, norm_reward=True,
+                           clip_obs=10.0, clip_reward=10.0, gamma=0.99)
+        for k, v in norm_state.items():
+            if k != "returns":
+                env.norm_state[k] = mx.array(v)
     log.info("test: env num_envs=%d n_symbols=%d T=%d", env.num_envs, env.n_symbols, env.T)
     goal_every = cfg.get("hrl", {}).get("goal_every", 4)
     goal_dim = cfg.get("hrl", {}).get("goal_dim", 3)
@@ -253,7 +260,8 @@ def _config_lines(cfg) -> list[str]:
         f"seed: {cfg.get('seed')}",
         f"symbols: {d.get('n_symbols')}  steps: {d.get('n_steps')}  dt_days: {d.get('dt_days')}",
         f"env: {d.get('n_symbols')} symbols x {e.get('n_envs_per_symbol')} = {d.get('n_symbols',0)*e.get('n_envs_per_symbol',0)} envs  "
-        f"lev={e.get('leverage')}x  eq={e.get('initial_balance')}  fee={e.get('fee_rate')}  funding={e.get('funding_rate')}",
+        f"lev {e.get('lev_min')}–{e.get('lev_max')}x  risk {float(e.get('risk_min',0))*100:.0f}–{float(e.get('risk_max',0))*100:.0f}%  "
+        f"eq={e.get('initial_balance')}  fee={e.get('fee_rate')}  funding={e.get('funding_rate')}",
         f"reward: {r.get('mode')}  dd_pen={r.get('drawdown_penalty')}  clip={r.get('reward_clip')}  trade_knob={e.get('trade_knob')}",
         f"hrl: goal_every={h.get('goal_every')}  goal_dim={h.get('goal_dim')}  "
         f"manager n_steps={cfg.get('manager',{}).get('n_steps')}  worker net={w.get('net_arch')} lr={w.get('learning_rate')}",
@@ -724,12 +732,12 @@ def ml_health(csv_path, out_path, title="agent", theme="synthwave", ma=10):
     return out_path
 
 
-def generate_report(cfg, manager, worker, out_dir):
+def generate_report(cfg, manager, worker, out_dir, norm_state=None):
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     theme = (cfg.get("report") or {}).get("theme", "synthwave")
     log.info("report: deterministic test rollout (theme=%s)", theme)
-    result = run_test(cfg, manager, worker)
+    result = run_test(cfg, manager, worker, norm_state=norm_state)
     log.info("report: %d trades, final_equity=%.4f", len(result["ledger"]), float(result["net"][-1]))
     write_ledger(result["ledger"], out_dir / "trades.csv")
     breakdown(result, out_dir / "breakdown.txt", cfg)

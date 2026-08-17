@@ -13,7 +13,7 @@ import logging
 import time
 
 import mlx.core as mx
-from dirty_mlx_ml.reinforcement import PPO, SAC
+from dirty_mlx_ml.reinforcement import PPO, SAC, VecNormalize
 from mlx.utils import tree_flatten, tree_unflatten
 from tqdm import tqdm
 
@@ -111,7 +111,10 @@ class JointHRL:
         h = dict(cfg.get("hrl", {}))
         self.goal_dim = h.get("goal_dim", 3)
         self.goal_every = h.get("goal_every", 4)
-        self.worker_env = make_env(cfg, "continuous", self.goal_dim, self.bundle, trade_knob=1.0)
+        self.worker_env = VecNormalize(
+            make_env(cfg, "continuous", self.goal_dim, self.bundle, trade_knob=1.0),
+            norm_obs=True, norm_reward=True, clip_obs=10.0, clip_reward=10.0, gamma=0.99,
+        )
         self.mgr_env = make_env(cfg, "discrete", 0, self.bundle)
         self.obs_mgr_dim = self.mgr_env.observation_space.shape[0]
         self.manager = make_ppo(self.mgr_env, cfg, log_dir)
@@ -288,6 +291,12 @@ class JointHRL:
             os.path.join(dirpath, "worker_actor.safetensors"),
             dict(tree_flatten(self.worker.actor.parameters())),
         )
+        ns = self.worker_env.norm_state
+        flat = {}
+        for k in ("obs_mean", "obs_var", "obs_count", "ret_mean", "ret_var", "ret_count"):
+            v = mx.array(ns[k])
+            flat[k] = v.reshape(-1) if v.ndim == 0 else v
+        mx.save_safetensors(os.path.join(dirpath, "worker_norm.safetensors"), flat)
         return dirpath
 
     def load(self, dirpath):
@@ -297,6 +306,12 @@ class JointHRL:
         self.manager.policy.update(tree_unflatten(list(m.items())))
         w = mx.load(os.path.join(dirpath, "worker_actor.safetensors"))
         self.worker.actor.update(tree_unflatten(list(w.items())))
+        p = os.path.join(dirpath, "worker_norm.safetensors")
+        if os.path.exists(p):
+            d = mx.load(p)
+            scalars = {"obs_count", "ret_mean", "ret_var", "ret_count"}
+            for k, v in d.items():
+                self.worker_env.norm_state[k] = v[0] if k in scalars else v
         return self
 
 

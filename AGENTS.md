@@ -16,3 +16,7 @@ Reference Issue Tracking: Link relevant issue numbers or pull request references
 
 Every python process launch should use venv/bin/python.
 This trading bot should use Apple MLX in the hot path.
+
+# Troubleshooting
+
+If the only nan in the training CSVs happen on the last row, ignore it: it means the episode didn't complete.
