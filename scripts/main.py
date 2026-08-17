@@ -65,7 +65,8 @@ def _train(cfg, run_dir: Path, log) -> JointHRL:
     j = None
     try:
         j = JointHRL(cfg, log_dir=str(train_dir))
-        j.learn(log_interval=cfg.get("train", {}).get("log_interval", 1))
+        j.learn(log_interval=cfg.get("train", {}).get("log_interval", 1),
+                log_every=cfg.get("train", {}).get("log_every", 0))
     except KeyboardInterrupt:
         log.warning("training interrupted by user; saving checkpoint")
         if j is not None:

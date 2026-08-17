@@ -162,7 +162,7 @@ class JointHRL:
         log.info("worker: SAC replay buffer = %d transitions ~= %.1f MB",
                  wrk_cfg.get("buffer_size", 10_000), buf_bytes / 1e6)
 
-    def learn(self, total_timesteps=None, log_interval=1, on_iter=None, checkpoint_every=300):
+    def learn(self, total_timesteps=None, log_interval=1, on_iter=None, checkpoint_every=300, log_every=0):
         cfg = self.cfg
         total = total_timesteps if total_timesteps is not None else cfg.get("train", {}).get(
             "total_timesteps", 4096
@@ -199,6 +199,9 @@ class JointHRL:
         iteration = 0
         sac_started = False
         last_ckpt = time.time()
+        if log_every <= 0:
+            log_every = cycle_steps  # fall back to once-per-cycle
+        next_log = log_every
         while sac.num_timesteps < total:
             ppo.buffer.reset()
             cycle_win = mx.zeros((n_envs,))
@@ -255,6 +258,11 @@ class JointHRL:
                 mgr_starts = finished
                 mgr_obs = self._mgr_obs(worker_obs, env._steps)
 
+                if sac.num_timesteps >= next_log:
+                    ppo.dump_logs(iteration)
+                    sac.dump_logs(iteration)
+                    next_log += log_every
+
             ppo.buffer.obs = mx.stack(obs_l)
             ppo.buffer.actions = mx.stack(act_l)
             ppo.buffer.rewards = mx.stack(rew_l)
@@ -290,8 +298,6 @@ class JointHRL:
                     iteration, sac.num_timesteps, fps, self.last_ep_rew_mean,
                     mx.get_active_memory() / 1e6, mx.get_peak_memory() / 1e6, ppo_m, sac_m,
                 )
-                ppo.dump_logs(iteration)
-                sac.dump_logs(iteration)
 
             if self.log_dir and time.time() - last_ckpt >= checkpoint_every:
                 self.save(self.log_dir)

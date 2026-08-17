@@ -47,6 +47,7 @@ report:
 train:
   total_timesteps: 20000000
   log_interval: 1
+  log_every: 200000
 
 hrl:
   goal_every: 8
