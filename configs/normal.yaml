@@ -17,13 +17,18 @@ env:
   initial_balance: 1000.0
   size_fraction: 1.0
   side_threshold: 0.2
+  trade_knob: 1.0
 
 reward:
   mode: normal
   drawdown_penalty: 1.0
+  reward_clip: 10.0
+
+report:
+  theme: ghibli
 
 train:
-  total_timesteps: 2000000
+  total_timesteps: 20000000
   log_interval: 1
 
 hrl:

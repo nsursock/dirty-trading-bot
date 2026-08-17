@@ -49,8 +49,10 @@ class TradingEnv:
         initial_balance: float = 1000.0,
         size_fraction: float = 1.0,
         side_threshold: float = 0.2,
+        trade_knob: float = 1.0,
         reward_mode: str = "smoke",
         drawdown_penalty: float = 1.0,
+        reward_clip: float = 10.0,
         goal_dim: int = 0,
         eval_every: int = 32,
         seed: int = 0,
@@ -83,8 +85,10 @@ class TradingEnv:
         self.initial_balance = float(initial_balance)
         self.size_fraction = float(size_fraction)
         self.side_threshold = float(side_threshold)
+        self.trade_knob = max(float(trade_knob), 1e-3)
         self.reward_mode = reward_mode
         self.drawdown_penalty = float(drawdown_penalty)
+        self.reward_clip = float(reward_clip)
         self.eval_every = max(int(eval_every), 1)
         self._step_count = 0
 
@@ -181,8 +185,10 @@ class TradingEnv:
         init_bal = self.initial_balance
         size_frac = self.size_fraction
         side_thr = self.side_threshold
+        trade_knob = self.trade_knob
         reward_mode = self.reward_mode
         dd_penalty = self.drawdown_penalty
+        reward_clip = self.reward_clip
 
         feats0 = mx.take(feats2d, sym_off, axis=0)
         pos0 = mx.concatenate([mx.ones((num_envs, 1)), mx.zeros((num_envs, 2))], axis=1)
@@ -230,7 +236,8 @@ class TradingEnv:
                 lev_frac = mx.full((num_envs,), size_frac)
             else:
                 a = mx.clip(mx.reshape(action.astype(mx.float32), (num_envs,)), -1.0, 1.0)
-                side = mx.where(mx.abs(a) > side_thr, mx.sign(a), 0.0)
+                eff_thr = side_thr / trade_knob
+                side = mx.where(mx.abs(a) > eff_thr, mx.sign(a), 0.0)
                 lev_frac = mx.maximum(mx.abs(a), 0.05)
 
             side = mx.where(liq, 0.0, side)
@@ -270,6 +277,7 @@ class TradingEnv:
                 reward = log_ret - dd_penalty * dd * dd
             else:
                 reward = log_ret
+            reward = mx.clip(reward, -reward_clip, reward_clip)
 
             bankrupt = eq_end < min_col
             trunc_data = t_next >= (T - 1)

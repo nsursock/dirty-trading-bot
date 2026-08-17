@@ -1,12 +1,12 @@
 seed: 42
 
 data:
-  n_symbols: 4
-  n_steps: 400
+  n_symbols: 8
+  n_steps: 2520
   dt_days: 252
 
 env:
-  n_envs_per_symbol: 4
+  n_envs_per_symbol: 1024   # 8 x 1024 = 8192 parallel envs (stress / plateau region)
   leverage: 5.0
   fee_rate: 0.0005
   slippage_bps: 1.0
@@ -17,10 +17,10 @@ env:
   initial_balance: 1000.0
   size_fraction: 1.0
   side_threshold: 0.2
-  trade_knob: 4.5
+  trade_knob: 1.0
 
 reward:
-  mode: smoke
+  mode: normal
   drawdown_penalty: 1.0
   reward_clip: 10.0
 
@@ -28,33 +28,33 @@ report:
   theme: ghibli
 
 train:
-  total_timesteps: 4096
+  total_timesteps: 100000000
   log_interval: 1
 
 hrl:
-  goal_every: 4
+  goal_every: 8
   goal_dim: 3
 
 manager:
   learning_rate: 0.0003
-  n_steps: 64
-  batch_size: 32
-  n_epochs: 4
+  n_steps: 256
+  batch_size: 64
+  n_epochs: 10
   gamma: 0.99
   gae_lambda: 0.95
   clip_range: 0.2
   ent_coef: 0.01
   vf_coef: 0.5
-  net_arch: [64, 64]
+  net_arch: [128, 128]
 
 worker:
   learning_rate: 0.0003
-  buffer_size: 10000
-  learning_starts: 512
-  batch_size: 128
+  buffer_size: 1000000
+  learning_starts: 4096
+  batch_size: 256
   tau: 0.005
   gamma: 0.99
   train_freq: 1
   gradient_steps: 1
   ent_coef: auto
-  net_arch: [128, 128]
+  net_arch: [256, 256]

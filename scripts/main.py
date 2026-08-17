@@ -75,8 +75,9 @@ def _train(cfg, run_dir: Path, log) -> JointHRL:
         log.exception("training failed: %s", e)
         raise
     _save(j, train_dir)
-    ml_health(train_dir / "manager_ppo.csv", train_dir / "manager_diag.png", "manager")
-    ml_health(train_dir / "worker_sac.csv", train_dir / "worker_diag.png", "worker")
+    theme = (cfg.get("report") or {}).get("theme", "synthwave")
+    ml_health(train_dir / "manager_ppo.csv", train_dir / "manager_diag.png", "manager", theme=theme)
+    ml_health(train_dir / "worker_sac.csv", train_dir / "worker_diag.png", "worker", theme=theme)
     log.info("training done: artifacts -> %s", train_dir)
     return j
 

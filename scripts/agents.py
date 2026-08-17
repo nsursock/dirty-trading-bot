@@ -46,12 +46,14 @@ def _env_kwargs(cfg) -> dict:
     return e
 
 
-def make_env(cfg, action_space: str, goal_dim: int = 0, bundle=None) -> TradingEnv:
+def make_env(cfg, action_space: str, goal_dim: int = 0, bundle=None, trade_knob=None) -> TradingEnv:
     if bundle is None:
         bundle = build_bundle(cfg)
     kw = _env_kwargs(cfg)
     kw["action_space"] = action_space
     kw["goal_dim"] = goal_dim
+    if trade_knob is not None:
+        kw["trade_knob"] = trade_knob
     return TradingEnv(bundle.features, bundle.ohlcv.closes, seed=cfg.get("seed", 42), **kw)
 
 
@@ -109,7 +111,7 @@ class JointHRL:
         h = dict(cfg.get("hrl", {}))
         self.goal_dim = h.get("goal_dim", 3)
         self.goal_every = h.get("goal_every", 4)
-        self.worker_env = make_env(cfg, "continuous", self.goal_dim, self.bundle)
+        self.worker_env = make_env(cfg, "continuous", self.goal_dim, self.bundle, trade_knob=1.0)
         self.mgr_env = make_env(cfg, "discrete", 0, self.bundle)
         self.obs_mgr_dim = self.mgr_env.observation_space.shape[0]
         self.manager = make_ppo(self.mgr_env, cfg, log_dir)

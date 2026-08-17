@@ -13,6 +13,7 @@ from __future__ import annotations
 import csv
 import logging
 import os
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -238,125 +239,502 @@ def metrics(net, periods_per_year=252):
     }
 
 
-def breakdown(result, path):
+_BD_COLS = ["label", "num trades", "win rate %", "avg win", "avg loss",
+            "net profit", "sharpe", "max dd", "risk reward", "sortino", "calmar", "profit factor"]
+
+
+def _config_lines(cfg) -> list[str]:
+    d = cfg.get("data", {})
+    e = cfg.get("env", {})
+    r = cfg.get("reward", {})
+    h = cfg.get("hrl", {})
+    w = cfg.get("worker", {})
+    return [
+        f"seed: {cfg.get('seed')}",
+        f"symbols: {d.get('n_symbols')}  steps: {d.get('n_steps')}  dt_days: {d.get('dt_days')}",
+        f"env: {d.get('n_symbols')} symbols x {e.get('n_envs_per_symbol')} = {d.get('n_symbols',0)*e.get('n_envs_per_symbol',0)} envs  "
+        f"lev={e.get('leverage')}x  eq={e.get('initial_balance')}  fee={e.get('fee_rate')}  funding={e.get('funding_rate')}",
+        f"reward: {r.get('mode')}  dd_pen={r.get('drawdown_penalty')}  clip={r.get('reward_clip')}  trade_knob={e.get('trade_knob')}",
+        f"hrl: goal_every={h.get('goal_every')}  goal_dim={h.get('goal_dim')}  "
+        f"manager n_steps={cfg.get('manager',{}).get('n_steps')}  worker net={w.get('net_arch')} lr={w.get('learning_rate')}",
+    ]
+
+
+def _trade_stats(trades, base=1000.0):
+    pnls = np.array([float(t.get("realized_pnl", 0.0) or 0.0) for t in trades], dtype=float)
+    n = int(pnls.size)
+    if n == 0:
+        return dict(num=0, win_rate=0.0, avg_win=0.0, avg_loss=0.0, net=0.0, sharpe=0.0,
+                    max_dd=0.0, rr=0.0, sortino=0.0, calmar=0.0, pf=0.0)
+    wins, losses = pnls[pnls > 0], pnls[pnls < 0]
+    net = float(pnls.sum())
+    mean = float(pnls.mean())
+    std = float(pnls.std())
+    win_rate = 100.0 * float((pnls > 0).mean())
+    avg_win = float(wins.mean()) if wins.size else 0.0
+    avg_loss = float(losses.mean()) if losses.size else 0.0
+    sharpe = mean / std * np.sqrt(n) if std > 1e-12 else 0.0
+    cum = np.cumsum(pnls)
+    peak = np.maximum.accumulate(cum)
+    dd = cum - peak
+    dd_min = float(dd.min())
+    max_dd = 100.0 * abs(dd_min) / max(abs(base), 1.0) if abs(dd_min) > 1e-9 else 0.0
+    rr = avg_win / abs(avg_loss) if losses.size and abs(avg_loss) > 1e-12 else 0.0
+    down = pnls[pnls < 0]
+    dstd = float(down.std()) if down.size else 0.0
+    sortino = mean / dstd * np.sqrt(n) if dstd > 1e-12 else 0.0
+    gw = float(wins.sum()) if wins.size else 0.0
+    gl = float(abs(losses.sum())) if losses.size else 0.0
+    pf = gw / gl if gl > 1e-12 else (999.0 if gw > 0 else 0.0)
+    calmar = mean / abs(dd_min) if abs(dd_min) > 1e-12 else 0.0
+    return dict(num=n, win_rate=win_rate, avg_win=avg_win, avg_loss=avg_loss, net=net,
+                sharpe=sharpe, max_dd=max_dd, rr=rr, sortino=sortino, calmar=calmar, pf=pf)
+
+
+def _bd_row(label, st):
+    return [label, st["num"], round(st["win_rate"], 2), round(st["avg_win"], 4),
+            round(st["avg_loss"], 4), round(st["net"], 4), round(st["sharpe"], 4),
+            round(st["max_dd"], 2), round(st["rr"], 4), round(st["sortino"], 4),
+            round(st["calmar"], 4), round(st["pf"], 4)]
+
+
+def _bd_table(title, groups, portfolio):
+    rows = [_BD_COLS]
+    for label, st in groups:
+        rows.append(_bd_row(label, st))
+    rows.append(_bd_row("portfolio", portfolio))
+    return [title, "", tabulate(rows, headers="firstrow", tablefmt="github", floatfmt=".4f"), ""]
+
+
+def breakdown(result, path, cfg=None):
     ledger = result["ledger"]
-    m = metrics(result["net"])
-    lines = []
-    lines.append("Table 1 — Performance by symbol")
-    by_sym = {}
-    for t in ledger:
-        b = by_sym.setdefault(t["symbol"], {"pnl": 0.0, "n": 0, "liq": 0})
-        b["pnl"] += t.get("realized_pnl", 0.0)
-        b["n"] += 1
-        b["liq"] += t.get("exit_type") == "liquidation"
-    lines.append(tabulate(
-        [[s, b["n"], round(b["pnl"], 4), b["liq"]] for s, b in sorted(by_sym.items())],
-        headers=["symbol", "trades", "pnl", "liquidations"],
-        tablefmt="github",
-    ))
+    net = np.asarray(result["net"])
+    base = float(net[0]) if net.size else 1000.0
+    m = metrics(net)
+    port = _trade_stats(ledger, base=base)
+    if m:
+        port["sharpe"] = m.get("sharpe", 0.0)
+        port["sortino"] = m.get("sortino", 0.0)
+        port["max_dd"] = 100.0 * m.get("max_drawdown", 0.0)
+        port["calmar"] = m.get("cagr", 0.0) / max(abs(m.get("max_drawdown", 0.0)), 1e-9)
+
+    def _bucket(trades, keyfn, order):
+        groups = {}
+        for t in trades:
+            groups.setdefault(keyfn(t), []).append(t)
+        return [(lab, _trade_stats(groups[lab], base=base)) for lab in order if lab in groups]
+
+    n = max(len(ledger), 1)
+    by_symbol = sorted({t["symbol"] for t in ledger})
+    sym_groups = [(s, _trade_stats([t for t in ledger if t["symbol"] == s], base=base)) for s in by_symbol]
+
+    by_side = _bucket(ledger, lambda t: t["side"], ["long", "short"])
+    by_exit = _bucket(ledger, lambda t: t["exit_type"], ["market_close", "liquidation"])
+    by_outcome = _bucket(ledger, lambda t: ("win" if (t.get("realized_pnl", 0) or 0) > 0 else
+                                            "loss" if (t.get("realized_pnl", 0) or 0) < 0 else "breakeven"),
+                         ["win", "loss", "breakeven"])
+
+    def _lev(t):
+        v = float(t.get("leverage", 0) or 0)
+        return "0-2.5x" if v <= 2.5 else "2.5-5x" if v <= 5 else "5-7.5x" if v <= 7.5 else "7.5-10x" if v <= 10 else "10x+"
+    by_lev = _bucket(ledger, _lev, ["0-2.5x", "2.5-5x", "5-7.5x", "7.5-10x", "10x+"])
+
+    def _hold(t):
+        d = int(t.get("closed_at", 0) or 0) - int(t.get("opened_at", 0) or 0)
+        return "flash (<2)" if d < 2 else "scalp (2-5)" if d < 5 else "sprint (5-15)" if d < 15 else "sit (15-60)" if d < 60 else "camp (60+)"
+    by_hold = _bucket(ledger, _hold, ["flash (<2)", "scalp (2-5)", "sprint (5-15)", "sit (15-60)", "camp (60+)"])
+
+    def _roe(t):
+        eb = float(t.get("equity_before", 0) or 0)
+        r = 100.0 * (float(t.get("realized_pnl", 0) or 0)) / max(abs(eb), 1e-9)
+        return "multi-R (>=10%)" if r >= 10 else "single-R (1-10%)" if r >= 1 else "scratch (<1%)" if r >= 0 else "loss (<0%)"
+    by_roe = _bucket(ledger, _roe, ["scratch (<1%)", "single-R (1-10%)", "multi-R (>=10%)", "loss (<0%)"])
+
+    def _notional(t):
+        v = float(t.get("notional", 0) or 0)
+        return "toy (<1k)" if v < 1000 else "standard (1-10k)" if v < 10_000 else "size (10-50k)" if v < 50_000 else "whale (>=50k)"
+    by_notional = _bucket(ledger, _notional, ["toy (<1k)", "standard (1-10k)", "size (10-50k)", "whale (>=50k)"])
+
+    def _fee_drag(t):
+        notional = max(abs(float(t.get("notional", 0) or 0)), 1e-9)
+        bps = 10_000.0 * float(t.get("fee", 0) or 0) / notional
+        return "free (maker)" if bps <= 0 else "light (<5 bps)" if bps < 5 else "heavy (>=5 bps)"
+    by_fee = _bucket(ledger, _fee_drag, ["free (maker)", "light (<5 bps)", "heavy (>=5 bps)"])
+
+    def _vintage(t):
+        i = ledger.index(t)
+        frac = i / n
+        return "opening act (first 20%)" if frac < 0.2 else "encore (last 20%)" if frac >= 0.8 else "mid-set (20-80%)"
+    by_vintage = _bucket(ledger, _vintage, ["opening act (first 20%)", "mid-set (20-80%)", "encore (last 20%)"])
+
+    lines = ["BREAKDOWN", "=========", ""]
+    if cfg is not None:
+        lines += _config_lines(cfg)
+        lines.append("")
+    lines.append(f"portfolio: {port['num']} trades  final_equity={float(net[-1]):.2f}  "
+                 f"ret={m.get('total_return', 0):+.2%}  sharpe={port['sharpe']:.3f}  max_dd={port['max_dd']:.2f}%")
     lines.append("")
-    lines.append("Table 2 — Aggregate metrics")
-    lines.append(tabulate([[k, round(v, 4)] for k, v in m.items()], headers=["metric", "value"], tablefmt="github"))
-    lines.append("")
-    lines.append("Table 3 — Exit type counts")
-    exits = result["exits"]
-    lines.append(tabulate(
-        [[e, exits.count(e)] for e in sorted(set(exits))],
-        headers=["exit_type", "count"],
-        tablefmt="github",
-    ))
+    for title, groups in [
+        ("By symbol", sym_groups),
+        ("By side", by_side),
+        ("By exit", by_exit),
+        ("By outcome", by_outcome),
+        ("By leverage", by_lev),
+        ("By hold duration", by_hold),
+        ("By RoE", by_roe),
+        ("By notional", by_notional),
+        ("By fee drag", by_fee),
+        ("By trade vintage", by_vintage),
+    ]:
+        lines += _bd_table(title, groups, port)
+
+    lines.append("Baselines (after fees/funding/slip)")
+    lines.append(f"  policy: {float(net[0]):.2f} -> {float(net[-1]):.2f}  ({m.get('total_return', 0):+.3f})")
+    lines.append(f"  flat: 1000.00 -> 1000.00  (+0.000)")
     text = "\n".join(lines)
     with open(path, "w") as fh:
         fh.write(text)
     return text
 
 
-def figure1(result, path):
-    net, gross = result["net"], result["gross"]
-    steps = result["steps"]
+# --- iso-trading-bot-style figure scaffolding (synthwave / ghibli themes) ---
+
+
+def _rgba(hex_color: str, alpha: float) -> str:
+    r, g, b = (int(hex_color[i : i + 2], 16) for i in (1, 3, 5))
+    return f"rgba({r},{g},{b},{alpha})"
+
+
+def _palette(theme: str) -> dict:
+    """Map a dirty-mkt-data theme (synthwave / ghibli / valorant) onto the
+    iso-trading-bot ``_C`` palette roles (up=positive, down=negative, accent=highlight).
+
+    ``muted`` (tick labels / subtitles) is derived from the background's
+    brightness so it always has readable contrast on light *and* dark themes.
+    """
+    from dirty_mkt_data.viz.themes import THEMES
+
+    t = THEMES[theme]
+    up, down, accent = t.up, t.down, t.accent
+    r, g, b = (int(t.background[i : i + 2], 16) for i in (1, 3, 5))
+    dark_bg = (r + g + b) / 3.0 < 128.0
+    muted = "#9AA4B2" if dark_bg else "#5C6570"
+    return {
+        "bg": t.background,
+        "panel": t.plot_background,
+        "ink": t.text,
+        "muted": muted,
+        "grid": t.grid,
+        "spine": t.grid,
+        "cyan": up,
+        "cyan_soft": _rgba(up, 0.22),
+        "cyan_glow": _rgba(up, 0.45),
+        "magenta": down,
+        "magenta_soft": _rgba(down, 0.28),
+        "lime": accent,
+        "lime_soft": _rgba(accent, 0.20),
+        "violet": accent,
+        "amber": accent,
+        "slate": muted,
+        "long": up,
+        "short": down,
+    }
+
+
+_FONT = dict(family="JetBrains Mono, Menlo, Monaco, Consolas, monospace")
+
+
+def _base_layout(c: dict, **extra) -> dict:
+    layout = dict(
+        paper_bgcolor=c["bg"],
+        plot_bgcolor=c["panel"],
+        font=dict(family=_FONT["family"], color=c["ink"]),
+        title_font=dict(size=18, color=c["cyan"], family=_FONT["family"]),
+        margin=dict(l=60, r=32, t=72, b=52),
+        legend=dict(bgcolor="rgba(0,0,0,0)", borderwidth=0, font=dict(size=11, color=c["ink"])),
+        hovermode="x unified",
+        hoverlabel=dict(
+            bgcolor=c["panel"], bordercolor=c["cyan"],
+            font=dict(color=c["ink"], size=11, family=_FONT["family"]),
+        ),
+    )
+    layout.update(extra)
+    return layout
+
+
+def _style_axes(fig, rows, cols, c: dict, pct_y=None, pct_x=None):
+    pct_y = pct_y or set()
+    pct_x = pct_x or set()
+    for r in range(1, rows + 1):
+        for cc in range(1, cols + 1):
+            fig.update_xaxes(
+                row=r, col=cc, showgrid=True, gridcolor=c["grid"], gridwidth=1,
+                zeroline=False, showline=True, linecolor=c["spine"], linewidth=1, mirror=False,
+                tickfont=dict(size=10, color=c["muted"]), title_font=dict(size=11, color=c["muted"]),
+                tickformat=".1%" if (r, cc) in pct_x else None, automargin=True,
+            )
+            fig.update_yaxes(
+                row=r, col=cc, showgrid=True, gridcolor=c["grid"], gridwidth=1,
+                zeroline=False, showline=True, linecolor=c["spine"], linewidth=1, mirror=False,
+                tickfont=dict(size=10, color=c["muted"]), title_font=dict(size=11, color=c["muted"]),
+                tickformat=".1%" if (r, cc) in pct_y else None, automargin=True,
+            )
+
+
+def _write_png(fig, path, width=1280, height=920, scale=2):
+    fig.write_image(str(path), format="png", width=width, height=height, scale=scale)
+
+
+def figure1(result, path, theme="synthwave"):
+    c = _palette(theme)
+    net, gross = np.asarray(result["net"]), np.asarray(result["gross"])
+    steps = np.asarray(result["steps"])
     rets = _returns(net)
+    if rets.size == 0:
+        rets = np.zeros(1)
     peak = np.maximum.accumulate(net)
-    dd = (peak - net) / peak
+    dd = (net - peak) / np.maximum(peak, 1e-8)
+    max_dd = float(dd.min())
+    net_ret = float(net[-1] / max(net[0], 1e-8) - 1.0)
+    gross_ret = float(gross[-1] / max(gross[0], 1e-8) - 1.0)
+    fees = float(np.sum(gross - net))
+    n_close = len(result["ledger"])
 
-    fig = make_subplots(rows=2, cols=2, subplot_titles=(
-        "Equity curves", "Returns over time", "Drawdown", "Return distribution"))
-    fig.add_trace(go.Scatter(x=steps, y=net, name="net"), 1, 1)
-    fig.add_trace(go.Scatter(x=steps, y=gross, name="gross"), 1, 1)
-    fig.add_trace(go.Scatter(x=steps[1:], y=rets, name="returns"), 1, 2)
-    fig.add_trace(go.Scatter(x=steps, y=-dd, name="drawdown"), 2, 1)
-    fig.add_trace(go.Histogram(x=rets, nbinsx=50, name="ret dist"), 2, 2)
-    fig.update_layout(title="Figure 1 — Performance", height=800)
-    fig.write_image(path, scale=2.0)
+    fig = make_subplots(
+        rows=2, cols=2,
+        subplot_titles=("Equity curve", "Trade returns", "Drawdown", "Return distribution"),
+        horizontal_spacing=0.09, vertical_spacing=0.14,
+    )
+
+    # cost band between gross and net
+    fig.add_trace(go.Scatter(x=steps, y=gross, mode="lines", line=dict(width=0),
+                             showlegend=False, hoverinfo="skip"), 1, 1)
+    fig.add_trace(go.Scatter(x=steps, y=net, mode="lines", fill="tonexty",
+                             fillcolor=c["magenta_soft"], line=dict(color=c["cyan"], width=0),
+                             showlegend=False, hoverinfo="skip"), 1, 1)
+    # glow under net
+    fig.add_trace(go.Scatter(x=steps, y=net, mode="lines", line=dict(color=c["cyan"], width=7),
+                             opacity=0.2, showlegend=False, hoverinfo="skip"), 1, 1)
+    fig.add_trace(go.Scatter(x=steps, y=net, mode="lines", line=dict(color=c["cyan"], width=2.6), name="Net"), 1, 1)
+    fig.add_trace(go.Scatter(x=steps, y=gross, mode="lines", line=dict(color=c["lime"], width=1.8, dash="dot"), name="Gross"), 1, 1)
+    fig.add_hline(y=float(net[0]), line=dict(color=c["muted"], width=1, dash="dash"), row=1, col=1)
+
+    win = rets >= 0
+    fig.add_trace(go.Scatter(x=steps[1:][win], y=rets[win], mode="markers",
+                             marker=dict(size=7, color=c["cyan"], opacity=0.75, line=dict(width=0)), name="Win"), 1, 2)
+    fig.add_trace(go.Scatter(x=steps[1:][~win], y=rets[~win], mode="markers",
+                             marker=dict(size=7, color=c["magenta"], opacity=0.75, line=dict(width=0)), name="Loss"), 1, 2)
+    fig.add_hline(y=0, line=dict(color=c["spine"], width=1), row=1, col=2)
+
+    fig.add_trace(go.Scatter(x=steps, y=dd, mode="lines", fill="tozeroy", fillcolor=c["magenta_soft"],
+                             line=dict(color=c["magenta"], width=2.4), name="Drawdown", showlegend=False), 2, 1)
+    fig.add_trace(go.Histogram(x=rets, nbinsx=36, marker=dict(color=c["cyan"], line=dict(color=c["bg"], width=0.6), opacity=0.9),
+                               showlegend=False), 2, 2)
+    fig.add_vline(x=0, line=dict(color=c["muted"], width=1, dash="dash"), row=2, col=2)
+    fig.add_vline(x=float(np.mean(rets)), line=dict(color=c["lime"], width=1.8), row=2, col=2)
+
+    fig.update_layout(**_base_layout(c, title=dict(
+        text=(f"Equity & risk<br><sup style='color:{c['muted']}'>"
+              f"Net {net_ret:+.1%} · gross {gross_ret:+.1%} · costs {fees:,.0f} · max DD {max_dd:.1%} · {n_close} closes</sup>"),
+        x=0.01, xanchor="left"),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=1, xanchor="right"),
+        margin=dict(l=60, r=32, t=72, b=88)))
+    fig.update_yaxes(title_text="Equity (USDC)", row=1, col=1)
+    fig.update_yaxes(title_text="Return", row=1, col=2)
+    fig.update_yaxes(title_text="Drawdown", row=2, col=1)
+    fig.update_yaxes(title_text="Count", row=2, col=2)
+    fig.update_xaxes(title_text="Step", row=1, col=1)
+    fig.update_xaxes(title_text="Step", row=1, col=2)
+    fig.update_xaxes(title_text="Step", row=2, col=1)
+    fig.update_xaxes(title_text="Return", row=2, col=2)
+    fig.update_annotations(font=dict(size=13, color=c["lime"]))
+    _style_axes(fig, 2, 2, c, pct_y={(1, 2)}, pct_x={(2, 2)})
+    _write_png(fig, path)
     return path
 
 
-def figure2(result, path):
-    lev, coll = result["leverage"], result["collateral"]
+def figure2(result, path, theme="synthwave"):
+    c = _palette(theme)
+    lev = np.asarray(result["leverage"])
+    coll = np.asarray(result["collateral"])
     sides, exits = result["sides"], result["exits"]
+    exit_colors = {
+        "tp": c["cyan"], "sl": c["amber"], "market": c["violet"], "market_close": c["violet"],
+        "liquidation": c["magenta"], "limit": c["slate"], "bankrupt": "#FF4D6D", "none": c["muted"],
+    }
 
-    fig = make_subplots(rows=2, cols=2, subplot_titles=(
-        "Leverage distribution", "Collateral distribution", "Long/Short", "Exit types"))
-    fig.add_trace(go.Histogram(x=lev, nbinsx=40), 1, 1)
-    fig.add_trace(go.Histogram(x=coll, nbinsx=40), 1, 2)
-    from collections import Counter
+    fig = make_subplots(
+        rows=2, cols=2,
+        subplot_titles=("Leverage", "Collateral", "Direction", "Exit type"),
+        horizontal_spacing=0.09, vertical_spacing=0.14,
+    )
 
-    fig.add_trace(go.Bar(x=list(Counter(sides)), y=list(Counter(sides).values())), 2, 1)
-    fig.add_trace(go.Bar(x=list(Counter(exits)), y=list(Counter(exits).values())), 2, 2)
-    fig.update_layout(title="Figure 2 — Risk & behavior", height=800)
-    fig.write_image(path, scale=2.0)
+    fig.add_trace(go.Histogram(x=lev if lev.size else [0], nbinsx=24,
+                               marker=dict(color=c["cyan"], line=dict(color=c["bg"], width=0.6), opacity=0.92),
+                               showlegend=False), 1, 1)
+    if lev.size:
+        fig.add_vline(x=float(np.median(lev)), line=dict(color=c["lime"], width=1.8, dash="dash"), row=1, col=1)
+    fig.add_trace(go.Histogram(x=coll if coll.size else [0], nbinsx=24,
+                               marker=dict(color=c["violet"], line=dict(color=c["bg"], width=0.6), opacity=0.92),
+                               showlegend=False), 1, 2)
+    if coll.size:
+        fig.add_vline(x=float(np.median(coll)), line=dict(color=c["lime"], width=1.8, dash="dash"), row=1, col=2)
+
+    cnt = Counter(sides)
+    fig.add_trace(go.Bar(x=["Long", "Short"], y=[cnt.get("long", 0), cnt.get("short", 0)],
+        marker=dict(color=[c["long"], c["short"]], line=dict(width=0), opacity=0.95),
+        text=[cnt.get("long", 0), cnt.get("short", 0)], textposition="outside",
+        textfont=dict(size=12, color=c["ink"]), showlegend=False), 2, 1)
+
+    ecnt = Counter(exits)
+    order = [k for k in ("tp", "sl", "market", "market_close", "liquidation", "limit", "bankrupt") if k in ecnt]
+    order += [k for k in ecnt if k not in order]
+    if not order:
+        order, vals = ["none"], [0]
+    else:
+        vals = [ecnt[k] for k in order]
+    colors = [exit_colors.get(k, c["muted"]) for k in order]
+    fig.add_trace(go.Bar(x=order, y=vals, marker=dict(color=colors, line=dict(width=0), opacity=0.95),
+        text=vals, textposition="outside", textfont=dict(size=12, color=c["ink"]), showlegend=False), 2, 2)
+
+    fig.update_layout(**_base_layout(c, title=dict(text="Trade anatomy", x=0.01, xanchor="left"),
+        showlegend=False, bargap=0.28))
+    for r in (1, 2):
+        fig.update_yaxes(title_text="Count", row=r, col=1)
+        fig.update_yaxes(title_text="Count", row=r, col=2)
+    fig.update_xaxes(title_text="Leverage (x)", row=1, col=1)
+    fig.update_xaxes(title_text="Initial margin (USDC)", row=1, col=2)
+    fig.update_xaxes(title_text="Side", row=2, col=1)
+    fig.update_xaxes(title_text="Exit type", row=2, col=2)
+    fig.update_annotations(font=dict(size=13, color=c["lime"]))
+    _style_axes(fig, 2, 2, c)
+    _write_png(fig, path)
     return path
 
 
-def _csv_columns(path):
-    with open(path) as fh:
-        r = csv.DictReader(fh)
-        rows = list(r)
-    if not rows:
-        return {}, np.array([])
-    cols = list(rows[0].keys())
-    data = {c: np.array([float(r[c]) if r[c] not in ("", "nan") else np.nan for r in rows]) for c in cols}
-    return data, cols
+_SAC_ALIASES = {
+    "train/loss/policy": ("train/actor_loss",),
+    "train/loss/critic": ("train/critic_loss",),
+    "train/loss/alpha": ("train/ent_coef_loss",),
+    "train/policy/alpha": ("train/ent_coef",),
+}
+PPO_KEYS = (
+    "time/fps", "rollout/ep_rew_mean", "rollout/ep_len_mean",
+    "train/policy_gradient_loss", "train/value_loss", "train/entropy_loss",
+    "train/approx_kl", "train/clip_fraction", "train/explained_variance",
+    "train/learning_rate", "train/n_updates", "train/loss",
+)
+SAC_KEYS = (
+    "time/fps", "rollout/ep_rew_mean", "rollout/ep_len_mean",
+    "train/loss/policy", "train/loss/critic", "train/loss/alpha",
+    "train/policy/alpha", "train/value/q_mean", "train/policy/log_pi_mean",
+    "train/ent_coef", "train/learning_rate", "train/n_updates",
+)
 
 
-def _ma(x, n=10):
-    out = np.full_like(x, np.nan)
-    c = np.cumsum(np.nan_to_num(x))
-    for i in range(len(x)):
-        lo = max(0, i - n + 1)
-        out[i] = c[i] - (c[lo - 1] if lo > 0 else 0)
-        out[i] /= (i - lo + 1)
+def _col_floats(rows, key):
+    ys = []
+    for row in rows:
+        v = row.get(key)
+        if v in (None, ""):
+            ys.append(np.nan)
+            continue
+        try:
+            ys.append(float(v))
+        except (TypeError, ValueError):
+            ys.append(np.nan)
+    return np.asarray(ys, dtype=float)
+
+
+def _series(rows, key):
+    y = _col_floats(rows, key)
+    if np.isfinite(y).any():
+        return y
+    for alt in _SAC_ALIASES.get(key, ()):
+        y = _col_floats(rows, alt)
+        if np.isfinite(y).any():
+            return y
+    return y
+
+
+def _ma_nan(x, w=10):
+    """Causal trailing mean (expanding until w), NaN-aware (iso-trading-bot port)."""
+    y = np.asarray(x, dtype=float)
+    if y.size == 0:
+        return y.copy()
+    w = max(1, int(w))
+    if w == 1:
+        return y.copy()
+    ok = np.isfinite(y)
+    y0 = np.where(ok, y, 0.0)
+    cs_y = np.concatenate([[0.0], np.cumsum(y0)])
+    cs_n = np.concatenate([[0.0], np.cumsum(ok.astype(float))])
+    idx = np.arange(1, y.size + 1)
+    j = np.maximum(0, idx - w)
+    dn = cs_n[idx] - cs_n[j]
+    out = np.full(y.size, np.nan)
+    good = dn > 0
+    out[good] = (cs_y[idx][good] - cs_y[j][good]) / dn[good]
     return out
 
 
-def ml_health(csv_path, out_path, title="agent"):
-    data, _ = _csv_columns(csv_path)
-    if not data:
+def ml_health(csv_path, out_path, title="agent", theme="synthwave", ma=10):
+    c = _palette(theme)
+    with open(csv_path) as fh:
+        rows = list(csv.DictReader(fh))
+    if not rows:
         return None
-    picks = [c for c in data if any(
-        k in c for k in ("ep_rew_mean", "value_loss", "policy_gradient", "actor_loss",
-                         "critic_loss", "ent_coef", "entropy_loss", "clip_fraction",
-                         "approx_kl", "explained_variance", "fps", "loss", "q_mean", "log_pi")
-    )][:12]
-    fig = make_subplots(rows=4, cols=3, subplot_titles=picks)
-    for i, c in enumerate(picks):
+    is_sac = "sac" in Path(csv_path).stem.lower()
+    keys = SAC_KEYS if is_sac else PPO_KEYS
+    titles = list(keys) + [""] * (12 - len(keys))
+    xs = _col_floats(rows, "time/total_timesteps")
+    if np.isfinite(xs).any():
+        xlabel = "timesteps"
+    else:
+        xs = np.arange(len(rows), dtype=float)
+        xlabel = "dump"
+
+    fig = make_subplots(rows=4, cols=3, subplot_titles=titles,
+                        horizontal_spacing=0.08, vertical_spacing=0.10)
+    for i, k in enumerate(keys):
         r, col = divmod(i, 3)
-        fig.add_trace(go.Scatter(y=data[c], mode="lines", name=c), r + 1, col + 1)
-        fig.add_trace(go.Scatter(y=_ma(data[c]), mode="lines", name=c + " (ma)"), r + 1, col + 1)
-    fig.update_layout(title=f"ML health — {title}", height=1200)
-    fig.write_image(out_path, scale=2.0)
+        r, col = r + 1, col + 1
+        ys = _series(rows, k)
+        mask = np.isfinite(xs) & np.isfinite(ys)
+        x_f, y_f = xs[mask], ys[mask]
+        if y_f.size == 0:
+            fig.update_yaxes(title_text=k.split("/", 1)[-1], row=r, col=col)
+            continue
+        trend = _ma_nan(y_f, ma)
+        mode = "lines+markers" if y_f.size < 80 else "lines"
+        fig.add_trace(go.Scatter(x=x_f, y=y_f, mode=mode, name="raw", legendgroup="raw", showlegend=(i == 0),
+                                 line=dict(color=c["violet"], width=1.5),
+                                 marker=dict(size=5, color=c["violet"], opacity=0.85), opacity=0.9), r, col)
+        fig.add_trace(go.Scatter(x=x_f, y=trend, mode="lines", name=f"MA{ma}", legendgroup="ma", showlegend=(i == 0),
+                                 line=dict(color=c["cyan"], width=2.3)), r, col)
+        fig.update_yaxes(title_text=k.split("/", 1)[-1], row=r, col=col)
+        fig.update_xaxes(title_text=xlabel, row=r, col=col)
+
+    fig.update_layout(**_base_layout(c, title=dict(text=title or Path(csv_path).stem, x=0.01, xanchor="left"),
+        showlegend=True, legend=dict(orientation="h", yanchor="bottom", y=1.02, x=1, xanchor="right"),
+        margin=dict(l=72, r=36, t=88, b=64)))
+    fig.update_annotations(font=dict(size=11, color=c["lime"]))
+    _style_axes(fig, 4, 3, c)
+    _write_png(fig, out_path, width=1480, height=1180)
     return out_path
 
 
 def generate_report(cfg, manager, worker, out_dir):
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    log.info("report: deterministic test rollout")
+    theme = (cfg.get("report") or {}).get("theme", "synthwave")
+    log.info("report: deterministic test rollout (theme=%s)", theme)
     result = run_test(cfg, manager, worker)
     log.info("report: %d trades, final_equity=%.4f", len(result["ledger"]), float(result["net"][-1]))
     write_ledger(result["ledger"], out_dir / "trades.csv")
-    breakdown(result, out_dir / "breakdown.txt")
-    figure1(result, out_dir / "figure1.png")
-    figure2(result, out_dir / "figure2.png")
+    breakdown(result, out_dir / "breakdown.txt", cfg)
+    figure1(result, out_dir / "figure1.png", theme=theme)
+    figure2(result, out_dir / "figure2.png", theme=theme)
     log.debug("report artifacts -> %s", out_dir)
     m = metrics(result["net"])
     log.debug("report metrics: %s", m)
