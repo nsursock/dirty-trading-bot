@@ -589,9 +589,11 @@ def figure1(result, path, theme="synthwave"):
 
 def figure2(result, path, theme="synthwave"):
     c = _palette(theme)
-    lev = np.asarray(result["leverage"])
-    coll = np.asarray(result["collateral"])
-    sides, exits = result["sides"], result["exits"]
+    ledger = result["ledger"]
+    lev = np.asarray([float(t.get("leverage", 0) or 0) for t in ledger])
+    coll = np.asarray([float(t.get("notional", 0) or 0) / (float(t.get("leverage", 0) or 1) or 1) for t in ledger])
+    sides = [t.get("side") for t in ledger]
+    exits = [t.get("exit_type") for t in ledger]
     exit_colors = {
         "tp": c["cyan"], "take_profit": c["cyan"], "sl": c["amber"], "stop_loss": c["amber"],
         "market": c["violet"], "market_close": c["violet"],
@@ -759,18 +761,38 @@ def ml_health(csv_path, out_path, title="agent", theme="synthwave", ma=10):
     return out_path
 
 
+def _ledger_equity(ledger, initial_balance=1000.0):
+    """Reconstruct the (closed-trade) equity curves from the ledger only."""
+    trades = sorted(ledger, key=lambda t: float(t.get("closed_at", 0) or 0))
+    pnl = np.array([float(t.get("realized_pnl", 0.0) or 0.0) for t in trades])
+    fees = np.array([float(t.get("fee", 0.0) or 0.0) for t in trades])
+    equity = initial_balance + np.cumsum(pnl)
+    gross = initial_balance + np.cumsum(pnl + fees)
+    xs = np.array([float(t.get("closed_at", 0) or 0) for t in trades])
+    return equity, gross, xs
+
+
 def generate_report(cfg, manager, worker, out_dir, norm_state=None):
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     theme = (cfg.get("report") or {}).get("theme", "synthwave")
     log.info("report: deterministic test rollout (theme=%s)", theme)
-    result = run_test(cfg, manager, worker, norm_state=norm_state)
-    log.info("report: %d trades, final_equity=%.4f", len(result["ledger"]), float(result["net"][-1]))
-    write_ledger(result["ledger"], out_dir / "trades.csv")
+    raw = run_test(cfg, manager, worker, norm_state=norm_state)
+    ledger = raw["ledger"]
+    init_bal = float((cfg.get("env") or {}).get("initial_balance", 1000.0))
+    net, gross, xs = _ledger_equity(ledger, init_bal)
+    result = {
+        "ledger": ledger,
+        "net": net,
+        "gross": gross,
+        "steps": xs,
+    }
+    log.info("report: %d trades, final_equity=%.4f", len(ledger), float(net[-1]) if len(net) else init_bal)
+    write_ledger(ledger, out_dir / "trades.csv")
     breakdown(result, out_dir / "breakdown.txt", cfg)
     figure1(result, out_dir / "figure1.png", theme=theme)
     figure2(result, out_dir / "figure2.png", theme=theme)
     log.debug("report artifacts -> %s", out_dir)
-    m = metrics(result["net"])
+    m = metrics(net)
     log.debug("report metrics: %s", m)
-    return {"out_dir": out_dir, "metrics": m, "n_trades": len(result["ledger"])}
+    return {"out_dir": out_dir, "metrics": m, "n_trades": len(ledger)}
