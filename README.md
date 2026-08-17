@@ -184,3 +184,30 @@ Measured on a MacBook Air **M3 16 GB**, smoke network sizes
 512 envs vs. an 8k+ "platinum" goal. Remaining optional work: compile the
 worker rollout into a single `mx.compile` graph, and the full 20-minute
 `powermetrics` thermal gate.
+
+## Environment scaling sweep
+
+Joint-loop throughput (rollout + PPO + SAC) and peak Metal memory vs. `n_envs`,
+doubling each step on the `normal.yaml` config (8 symbols, M3 Air 16 GB):
+
+| n_envs | steps/sec | peak Metal (GB) | scaling eff. |
+| ---: | ---: | ---: | ---: |
+| 16 | 15,339 | 0.26 | — |
+| 32 | 32,358 | 0.29 | 105% |
+| 64 | 68,263 | 0.36 | 105% |
+| 128 | 119,767 | 0.50 | 88% |
+| 256 | 234,577 | 0.77 | 98% |
+| 512 | 405,944 | 1.16 | 87% |
+| 1024 | 669,777 | 1.49 | 82% |
+| 2048 | 1,024,296 | 2.04 | 76% |
+| 4096 | 1,258,442 | 3.03 | 61% |
+| 8192 | 1,370,609 | 5.06 | 54% |
+
+- **FPS plateaus** at ~1.3–1.4M steps/sec around 4096–8192 envs (+9% from
+  4096→8192, scaling efficiency collapsed to 54%).
+- **Memory never swapped** — peak Metal memory 5.06 GB at 8192 envs, process
+  RSS steady ~0.3 GB. The binding constraint is **compute** (gradient updates +
+  per-step dispatch), not memory.
+- **FPS/GB sweet spot ≈ 1024–2048 envs** (~450–500k steps/sec per GB); the
+  default 512-env `normal.yaml` sits comfortably on the linear region with
+  plenty of headroom.
