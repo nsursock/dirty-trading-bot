@@ -195,25 +195,24 @@ single-cycle samples:
 
 | n_envs | steps/sec (mean ± std) | peak Metal (GB) | scaling eff. |
 | ---: | ---: | ---: | ---: |
-| 256 | 329,954 ± 5,137 | 0.81 | — |
-| 512 | 570,223 ± 6,357 | 1.23 | 86% |
-| 1024 | 853,830 ± 39,514 | 1.61 | 75% |
-| 2048 | 1,143,600 ± 26,351 | 2.27 | 67% |
-| 4096 | 1,264,005 ± 7,302 | 3.46 | 55% |
+| 256 | 259,881 ± 2,151 | 0.75 | — |
+| 512 | 494,399 ± 2,095 | 1.14 | 95% |
+| 1024 | 913,951 ± 4,579 | 1.45 | 92% |
+| 2048 | 1,524,978 ± 5,584 | 1.96 | 83% |
+| 4096 | 1,975,863 ± 96,058 | 2.85 | 65% |
 
-- **FPS plateaus at ~1.26M steps/sec around 4096 envs** (only ~11% more than
-  2048). The earlier single-cycle sweep slightly *understated* steady-state
-  throughput and showed a spurious super-linear bump at small `n_envs` — both
-  were warmup artifacts.
-- **Memory never swaps** — peak Metal memory 3.46 GB at 4096 envs, process RSS
+- **Throughput climbs to ~1.98M steps/sec at 4096 envs** and is still scaling
+  (+30% over 2048), so the plateau (previously ~1.26M) has not been reached
+  within this sweep. 4096 remains compute-bound rather than memory-bound.
+- **Memory never swaps** — peak Metal memory 2.85 GB at 4096 envs, process RSS
   steady ~0.3 GB. The binding constraint is **compute**, not memory.
-- **Bottleneck is the PPO update** (profiled at 2048 envs): ~1.8 s of a ~3.7 s
-  cycle, because its minibatch is `n_steps × n_envs`, so it grows with env
-  count. env.step (~0.48 s), SAC update (~0.04 s), and manager policy (~0.01 s)
-  are all negligible by comparison.
+- **Bottleneck is the PPO update** (minibatch `n_steps × n_envs`, so it grows
+  with env count). `n_epochs` 10→4 cut it ~2.5×, which is why 2048/4096 got
+  ~33–56% faster than the earlier sweep; the per-step cost (VecNormalize +
+  intrabar TP/SL) slightly slowed the small 256/512 points.
 - A **~3–14% within-run FPS decline** is visible over each point's cycles (a
   few tens of seconds) — consistent with the Air's passive thermal throttling.
   The 20-minute `powermetrics` thermal gate remains the outstanding check.
-- **FPS/GB sweet spot ≈ 1024–2048 envs** (~530–500k steps/sec per GB); the
-  default 512-env `normal.yaml` sits comfortably on the efficient region with
-  headroom.
+- **Sweet spot has shifted right to ~2048 envs** (throughput still climbing,
+  memory still modest); the default 512-env `normal.yaml` sits comfortably in
+  the efficient region with headroom.

@@ -15,6 +15,7 @@ Reference Issue Tracking: Link relevant issue numbers or pull request references
 ## Libraries / Development
 
 Every python process launch should use venv/bin/python.
+Run python scripts unsandboxed in IDEs.
 This trading bot should use Apple MLX in the hot path.
 
 # Troubleshooting
