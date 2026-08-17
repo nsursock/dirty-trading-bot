@@ -128,7 +128,7 @@ class JointHRL:
         self.goal_every = h.get("goal_every", 4)
         n = dict(cfg.get("norm", {}))
         self.worker_env = VecNormalize(
-            make_env(cfg, "continuous", self.goal_dim, self.bundle, trade_knob=1.0),
+            make_env(cfg, "continuous", self.goal_dim, self.bundle),
             norm_obs=n.get("norm_obs", True),
             norm_reward=n.get("norm_reward", True),
             clip_obs=n.get("clip_obs", 10.0),

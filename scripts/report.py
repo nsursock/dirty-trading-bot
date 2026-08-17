@@ -781,6 +781,13 @@ def generate_report(cfg, manager, worker, out_dir, norm_state=None):
     ledger = raw["ledger"]
     init_bal = float((cfg.get("env") or {}).get("initial_balance", 1000.0))
     net, gross, xs = _ledger_equity(ledger, init_bal)
+    if net.size == 0:
+        # No closed trades (e.g. a trader that stayed flat): keep the curve
+        # non-empty so downstream metrics/figures can render a flat line.
+        log.info("report: no closed trades; emitting flat equity at initial balance")
+        net = np.array([init_bal, init_bal])
+        gross = np.array([init_bal, init_bal])
+        xs = np.array([0.0, 1.0], dtype=float)
     result = {
         "ledger": ledger,
         "net": net,
