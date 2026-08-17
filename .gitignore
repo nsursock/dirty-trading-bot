@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+
+# Virtual env
+venv/
+.venv/
+
+# Run artifacts
+logs/
+*.log
+
+# Generated data / figures / model checkpoints
+figures/
+*.safetensors
+*.npz
+*.parquet
+*.csv
+
+# OS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+.cursor/
+
+# Project planning (not shipped)
+milestones/
+prompt.md
+

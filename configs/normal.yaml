@@ -1,0 +1,55 @@
+seed: 42
+
+data:
+  n_symbols: 8
+  n_steps: 2520
+  dt_days: 252
+
+env:
+  n_envs_per_symbol: 64
+  leverage: 5.0
+  fee_rate: 0.0005
+  slippage_bps: 1.0
+  funding_rate: 0.0001
+  maintenance_margin_rate: 0.005
+  liquidation_fee_rate: 0.01
+  min_collateral: 10.0
+  initial_balance: 1000.0
+  size_fraction: 1.0
+  side_threshold: 0.2
+
+reward:
+  mode: normal
+  drawdown_penalty: 1.0
+
+train:
+  total_timesteps: 2000000
+  log_interval: 1
+
+hrl:
+  goal_every: 8
+  goal_dim: 3
+
+manager:
+  learning_rate: 0.0003
+  n_steps: 256
+  batch_size: 64
+  n_epochs: 10
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_range: 0.2
+  ent_coef: 0.01
+  vf_coef: 0.5
+  net_arch: [128, 128]
+
+worker:
+  learning_rate: 0.0003
+  buffer_size: 1000000
+  learning_starts: 4096
+  batch_size: 256
+  tau: 0.005
+  gamma: 0.99
+  train_freq: 1
+  gradient_steps: 1
+  ent_coef: auto
+  net_arch: [256, 256]
