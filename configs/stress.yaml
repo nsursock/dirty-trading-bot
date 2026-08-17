@@ -6,6 +6,7 @@ data:
   timeframes:
     low: 5
     high: 240
+  regime: mix
 
 env:
   n_envs_per_symbol: 1024   # 8 x 1024 = 8192 parallel envs (stress / plateau region)

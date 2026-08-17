@@ -37,6 +37,7 @@ def build_bundle(cfg):
         seed=cfg.get("seed", 42),
         low_tf=tf.get("low", 5),
         high_tf=tf.get("high", 240),
+        regime=d.get("regime", "bull"),
     )
 
 

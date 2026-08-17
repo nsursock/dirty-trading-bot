@@ -168,6 +168,7 @@ def generate(
     low_tf: int = 5,
     high_tf: int = 240,
     base_volume: float = 1_000_000.0,
+    regime: str = "bull",
     dt: float | None = None,
 ) -> DataBundle:
     params = SYMBOLS if symbols is None else symbols
@@ -176,9 +177,22 @@ def generate(
     if dt is None:
         dt = low_tf / (60 * 24 * TRADING_DAYS)
     n = max(int(high_tf) // int(low_tf), 1)
+
+    mus = [params[s][0] for s in names]
+    sigmas = [params[s][1] for s in names]
+    s0s = [params[s][2] for s in names]
+    if regime == "neutral":
+        mus = [0.0] * len(names)
+    elif regime == "mix":
+        for i in range(len(names)):
+            mus[i] = mus[i] if i % 3 == 0 else (-mus[i] if i % 3 == 1 else 0.0)
+    elif regime != "bull":
+        raise ValueError(f"unknown regime: {regime}")
+    params = {s: (mus[i], sigmas[i], s0s[i]) for i, s in enumerate(names)}
+
     log.info(
-        "data: generating %d symbols x %d low-TF(%dm) steps, high-TF(%dm) x%d (seed=%d, dt=%.2e)",
-        len(names), n_steps, low_tf, high_tf, n, seed, dt,
+        "data: generating %d symbols x %d low-TF(%dm) steps, high-TF(%dm) x%d, regime=%s (seed=%d, dt=%.2e)",
+        len(names), n_steps, low_tf, high_tf, n, regime, seed, dt,
     )
 
     arrays = {k: [] for k in ("opens", "highs", "lows", "closes", "vols")}

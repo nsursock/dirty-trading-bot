@@ -58,6 +58,7 @@ def _test_env(cfg, seed_offset=1):
         seed=seed,
         low_tf=tf.get("low", 5),
         high_tf=tf.get("high", 240),
+        regime=d.get("regime", "bull"),
     )
     env = TradingEnv(bundle.features, bundle.ohlcv.closes,
                      highs=bundle.ohlcv.highs, lows=bundle.ohlcv.lows, seed=seed, **e)
