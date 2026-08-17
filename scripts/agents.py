@@ -30,11 +30,13 @@ def _slice_symbols(n: int) -> dict:
 def build_bundle(cfg):
     d = cfg.get("data", {})
     symbols = _slice_symbols(d.get("n_symbols", 4))
+    tf = d.get("timeframes", {})
     return generate(
         symbols=symbols,
         n_steps=d.get("n_steps", 400),
         seed=cfg.get("seed", 42),
-        dt=1.0 / d.get("dt_days", 252),
+        low_tf=tf.get("low", 5),
+        high_tf=tf.get("high", 240),
     )
 
 
@@ -54,7 +56,11 @@ def make_env(cfg, action_space: str, goal_dim: int = 0, bundle=None, trade_knob=
     kw["goal_dim"] = goal_dim
     if trade_knob is not None:
         kw["trade_knob"] = trade_knob
-    return TradingEnv(bundle.features, bundle.ohlcv.closes, seed=cfg.get("seed", 42), **kw)
+    return TradingEnv(
+        bundle.features, bundle.ohlcv.closes,
+        highs=bundle.ohlcv.highs, lows=bundle.ohlcv.lows,
+        seed=cfg.get("seed", 42), **kw,
+    )
 
 
 def make_ppo(env, cfg, log_dir=None) -> PPO:
@@ -104,6 +110,14 @@ def _one_hot(a, n: int) -> mx.array:
 class JointHRL:
     """Joint two-tier trainer: PPO manager (goals) + SAC worker (execution)."""
 
+    def _mgr_obs(self, worker_obs, low_steps):
+        """Manager sees high-TF features + current position/account state."""
+        F = self.worker_env.F
+        high_idx = mx.minimum(low_steps // self.n_resample, self.T_hi - 1)
+        feats = mx.take(self.high_feats2d, self.sym_off_high + high_idx, axis=0)
+        acct = worker_obs[:, F : F + 6]
+        return mx.concatenate([feats, acct], axis=1)
+
     def __init__(self, cfg, log_dir=None):
         self.cfg = cfg
         self.log_dir = log_dir
@@ -111,12 +125,24 @@ class JointHRL:
         h = dict(cfg.get("hrl", {}))
         self.goal_dim = h.get("goal_dim", 3)
         self.goal_every = h.get("goal_every", 4)
+        n = dict(cfg.get("norm", {}))
         self.worker_env = VecNormalize(
             make_env(cfg, "continuous", self.goal_dim, self.bundle, trade_knob=1.0),
-            norm_obs=True, norm_reward=True, clip_obs=10.0, clip_reward=10.0, gamma=0.99,
+            norm_obs=n.get("norm_obs", True),
+            norm_reward=n.get("norm_reward", True),
+            clip_obs=n.get("clip_obs", 10.0),
+            clip_reward=n.get("clip_reward", 10.0),
+            gamma=n.get("gamma", 0.99),
         )
         self.mgr_env = make_env(cfg, "discrete", 0, self.bundle)
         self.obs_mgr_dim = self.mgr_env.observation_space.shape[0]
+        S, T_hi, F_hi = self.bundle.high_features.shape
+        W = self.worker_env.n_envs_per_symbol
+        sym_idx = mx.array([s for s in range(S) for _ in range(W)], dtype=mx.int32)
+        self.high_feats2d = mx.reshape(self.bundle.high_features, (S * T_hi, F_hi))
+        self.sym_off_high = sym_idx * T_hi
+        self.T_hi = T_hi
+        self.n_resample = self.bundle.n_resample
         self.manager = make_ppo(self.mgr_env, cfg, log_dir)
         self.worker = make_sac(self.worker_env, cfg, log_dir)
         mgr_cfg = dict(cfg.get("manager", {}))
@@ -159,7 +185,7 @@ class JointHRL:
         ppo._roll_rew_sum = ppo._roll_len_sum = ppo._roll_ep_count = mx.array(0.0)
 
         worker_obs = env.reset()[0]
-        mgr_obs = worker_obs[:, :obs_mgr_dim]
+        mgr_obs = self._mgr_obs(worker_obs, env._steps)
         mgr_starts = mx.ones((n_envs,))
         log.debug("worker env reset: obs=%s", tuple(worker_obs.shape))
 
@@ -226,7 +252,7 @@ class JointHRL:
                 ppo._ep_len = (ppo._ep_len + 1.0) * (1.0 - finished)
 
                 mgr_starts = finished
-                mgr_obs = worker_obs[:, :obs_mgr_dim]
+                mgr_obs = self._mgr_obs(worker_obs, env._steps)
 
             ppo.buffer.obs = mx.stack(obs_l)
             ppo.buffer.actions = mx.stack(act_l)

@@ -44,6 +44,7 @@ def _test_env(cfg, seed_offset=1):
     e = dict(cfg.get("env", {}))
     r = dict(cfg.get("reward", {}))
     h = dict(cfg.get("hrl", {}))
+    tf = d.get("timeframes", {})
     e["n_envs_per_symbol"] = 1
     e["reward_mode"] = r.get("mode", "smoke")
     e["drawdown_penalty"] = r.get("drawdown_penalty", 1.0)
@@ -55,10 +56,12 @@ def _test_env(cfg, seed_offset=1):
         symbols=symbols,
         n_steps=d.get("n_steps", 400),
         seed=seed,
-        dt=1.0 / d.get("dt_days", 252),
+        low_tf=tf.get("low", 5),
+        high_tf=tf.get("high", 240),
     )
-    env = TradingEnv(bundle.features, bundle.ohlcv.closes, seed=seed, **e)
-    return env, list(bundle.symbols), e
+    env = TradingEnv(bundle.features, bundle.ohlcv.closes,
+                     highs=bundle.ohlcv.highs, lows=bundle.ohlcv.lows, seed=seed, **e)
+    return bundle, env, list(bundle.symbols), e
 
 
 def _finish_trade(tr, exit_price, exit_step, exit_type, fee, realized):
@@ -74,12 +77,21 @@ def _finish_trade(tr, exit_price, exit_step, exit_type, fee, realized):
     return tr
 
 
+def _mgr_obs_test(high_feats, sym_off_hi, worker_obs, low_steps, T_hi, F, n_resample):
+    import mlx.core as mx
+
+    high_idx = mx.minimum(low_steps // n_resample, T_hi - 1)
+    feats = mx.take(high_feats, sym_off_hi + high_idx, axis=0)
+    acct = worker_obs[:, F : F + 6]
+    return mx.concatenate([feats, acct], axis=1)
+
+
 def run_test(cfg, manager, worker, norm_state=None) -> dict:
     """Deterministic joint rollout -> ledger + per-step series."""
     import mlx.core as mx
     from dirty_mlx_ml.reinforcement import VecNormalize
 
-    env, symbols, e = _test_env(cfg)
+    bundle, env, symbols, e = _test_env(cfg)
     if norm_state is not None:
         env = VecNormalize(env, norm_obs=True, norm_reward=True,
                            clip_obs=10.0, clip_reward=10.0, gamma=0.99)
@@ -89,17 +101,22 @@ def run_test(cfg, manager, worker, norm_state=None) -> dict:
     log.info("test: env num_envs=%d n_symbols=%d T=%d", env.num_envs, env.n_symbols, env.T)
     goal_every = cfg.get("hrl", {}).get("goal_every", 4)
     goal_dim = cfg.get("hrl", {}).get("goal_dim", 3)
-    obs_mgr_dim = env.F + 6
     F, init_bal = env.F, e.get("initial_balance", 1000.0)
     n_envs = env.num_envs
-    sym_idx = [s for s in range(env.n_symbols) for _ in range(env.n_envs_per_symbol)]
+    S = env.n_symbols
+    n_resample = bundle.n_resample
+    T_hi = bundle.high_features.shape[1]
+    sym_idx = [s for s in range(S) for _ in range(env.n_envs_per_symbol)]
+    sym_off_hi = mx.array([s * T_hi for s in sym_idx], dtype=mx.int32)
+    high_feats = mx.reshape(bundle.high_features, (S * T_hi, bundle.high_features.shape[2]))
     side_thr = e.get("side_threshold", 0.2)
     fee_rate = e.get("fee_rate", 5e-4)
     funding = e.get("funding_rate", 1e-4)
     T = env.T
 
     worker_obs = env.reset()[0]
-    mgr_obs = worker_obs[:, :obs_mgr_dim]
+    mgr_obs = _mgr_obs_test(high_feats, sym_off_hi, worker_obs, mx.zeros((n_envs,), mx.int32),
+                            T_hi, F, n_resample)
 
     open_trades = [None] * n_envs
     ledger = []
@@ -114,7 +131,7 @@ def run_test(cfg, manager, worker, norm_state=None) -> dict:
     while t < T - 1:
         goal, _, _ = manager.policy.get_action(mgr_obs, deterministic=True)
         env.set_goal(_one_hot(goal, goal_dim))
-        for _ in range(goal_every):
+        for _k in range(goal_every):
             if t >= T - 1:
                 break
             act = worker._scale_action(worker.actor.sample(worker_obs, deterministic=True)[0])
@@ -133,6 +150,8 @@ def run_test(cfg, manager, worker, norm_state=None) -> dict:
             notional = np.abs(q) * price
             side = np.sign(q).astype(int)
             req = np.where(np.abs(act_np) > side_thr, np.sign(act_np), 0).astype(int)
+            exit_flags = _np(info.get("exit", mx.zeros((n_envs,), mx.int32))).astype(int)
+            _EXIT_NAMES = {0: "market_close", 1: "take_profit", 2: "stop_loss", 3: "liquidation"}
 
             for i in range(n_envs):
                 if prev_side[i] == 0 and side[i] != 0:
@@ -153,7 +172,8 @@ def run_test(cfg, manager, worker, norm_state=None) -> dict:
                 elif prev_side[i] != 0 and side[i] == 0:
                     tr = open_trades[i]
                     realized = float(equity[i] - tr["equity_before"])
-                    exit_type = "market_close" if req[i] == 0 else "liquidation"
+                    exit_type = _EXIT_NAMES.get(int(exit_flags[i]),
+                                                "market_close" if req[i] == 0 else "liquidation")
                     if tr is not None:
                         ledger.append(
                             _finish_trade(tr, float(price[i]), t, exit_type, fee_rate * notional[i], realized)
@@ -193,6 +213,10 @@ def run_test(cfg, manager, worker, norm_state=None) -> dict:
             step_axis.append(t)
             net_curve.append(float(np.mean(equity)))
             gross_curve.append(float(np.mean(equity + cum_fee)))
+
+            if _k == goal_every - 1:
+                low_steps = mx.minimum(env._steps, T - 1) if hasattr(env, "_steps") else t
+                mgr_obs = _mgr_obs_test(high_feats, sym_off_hi, worker_obs, low_steps, T_hi, F, n_resample)
 
     log.debug("test rollout done: steps=%d trades=%d final_equity=%.4f", t, len(ledger), net_curve[-1])
     return {
@@ -337,7 +361,8 @@ def breakdown(result, path, cfg=None):
     sym_groups = [(s, _trade_stats([t for t in ledger if t["symbol"] == s], base=base)) for s in by_symbol]
 
     by_side = _bucket(ledger, lambda t: t["side"], ["long", "short"])
-    by_exit = _bucket(ledger, lambda t: t["exit_type"], ["market_close", "liquidation"])
+    by_exit = _bucket(ledger, lambda t: t["exit_type"],
+                      ["take_profit", "stop_loss", "market_close", "liquidation"])
     by_outcome = _bucket(ledger, lambda t: ("win" if (t.get("realized_pnl", 0) or 0) > 0 else
                                             "loss" if (t.get("realized_pnl", 0) or 0) < 0 else "breakeven"),
                          ["win", "loss", "breakeven"])
@@ -567,7 +592,8 @@ def figure2(result, path, theme="synthwave"):
     coll = np.asarray(result["collateral"])
     sides, exits = result["sides"], result["exits"]
     exit_colors = {
-        "tp": c["cyan"], "sl": c["amber"], "market": c["violet"], "market_close": c["violet"],
+        "tp": c["cyan"], "take_profit": c["cyan"], "sl": c["amber"], "stop_loss": c["amber"],
+        "market": c["violet"], "market_close": c["violet"],
         "liquidation": c["magenta"], "limit": c["slate"], "bankrupt": "#FF4D6D", "none": c["muted"],
     }
 
@@ -595,7 +621,7 @@ def figure2(result, path, theme="synthwave"):
         textfont=dict(size=12, color=c["ink"]), showlegend=False), 2, 1)
 
     ecnt = Counter(exits)
-    order = [k for k in ("tp", "sl", "market", "market_close", "liquidation", "limit", "bankrupt") if k in ecnt]
+    order = [k for k in ("take_profit", "stop_loss", "market_close", "liquidation", "tp", "sl", "market", "limit", "bankrupt") if k in ecnt]
     order += [k for k in ecnt if k not in order]
     if not order:
         order, vals = ["none"], [0]

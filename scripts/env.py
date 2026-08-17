@@ -37,6 +37,8 @@ class TradingEnv:
         features,
         closes,
         *,
+        highs=None,
+        lows=None,
         action_space: str = "discrete",
         n_envs_per_symbol: int = 8,
         lev_min: float = 2.0,
@@ -50,6 +52,8 @@ class TradingEnv:
         max_collateral: float = 10_000.0,
         risk_min: float = 0.01,
         risk_max: float = 0.05,
+        take_profit: float = 0.0,
+        stop_loss: float = 0.0,
         initial_balance: float = 1000.0,
         size_fraction: float = 1.0,
         side_threshold: float = 0.2,
@@ -71,6 +75,8 @@ class TradingEnv:
         self.num_envs = self.n_symbols * n_envs_per_symbol
 
         self.closes_flat = mx.reshape(closes, (-1,))
+        self.highs_flat = mx.reshape(highs, (-1,)) if highs is not None else None
+        self.lows_flat = mx.reshape(lows, (-1,)) if lows is not None else None
         self.feats2d = mx.reshape(features, (self.n_symbols * self.T, self.F))
         sym_idx = mx.array(
             [s for s in range(self.n_symbols) for _ in range(n_envs_per_symbol)],
@@ -91,6 +97,8 @@ class TradingEnv:
         self.max_collateral = float(max_collateral)
         self.risk_min = float(risk_min)
         self.risk_max = float(risk_max)
+        self.take_profit = float(take_profit)
+        self.stop_loss = float(stop_loss)
         self.initial_balance = float(initial_balance)
         self.size_fraction = float(size_fraction)
         self.side_threshold = float(side_threshold)
@@ -196,6 +204,8 @@ class TradingEnv:
         max_coll = self.max_collateral
         risk_min = self.risk_min
         risk_max = self.risk_max
+        take_profit = self.take_profit
+        stop_loss = self.stop_loss
         init_bal = self.initial_balance
         size_frac = self.size_fraction
         side_thr = self.side_threshold
@@ -219,7 +229,7 @@ class TradingEnv:
         )
         mx.eval(obs_static0, reset_acct)
 
-        def step(state, steps, prev_done, key, action, price_prev, price, feats):
+        def step(state, steps, prev_done, key, action, price_prev, price, high, low, feats):
             mask = prev_done
             t = mx.where(mask, mx.zeros_like(steps), steps)
             t_next = t + 1
@@ -234,6 +244,33 @@ class TradingEnv:
 
             upnl = q * (price - entry)
             notional = mx.abs(q) * price
+
+            tp_hit = mx.zeros((num_envs,), dtype=mx.bool_)
+            sl_hit = mx.zeros((num_envs,), dtype=mx.bool_)
+            exit_hit = mx.zeros((num_envs,), dtype=mx.bool_)
+            if take_profit > 0.0 or stop_loss > 0.0:
+                long = q > EPS
+                short = q < -EPS
+                sl_px = mx.where(long, entry * (1.0 - stop_loss), entry * (1.0 + stop_loss))
+                tp_px = mx.where(long, entry * (1.0 + take_profit), entry * (1.0 - take_profit))
+                sl_touch = (long & (low <= entry * (1.0 - stop_loss))) | (
+                    short & (high >= entry * (1.0 + stop_loss))
+                )
+                tp_touch = (long & (high >= entry * (1.0 + take_profit))) | (
+                    short & (low <= entry * (1.0 - take_profit))
+                )
+                sl_hit = sl_touch
+                tp_hit = tp_touch & ~sl_touch
+                exit_hit = sl_touch | tp_touch
+                fill_exit = mx.where(sl_hit, sl_px, mx.where(tp_hit, tp_px, price))
+                balance = mx.where(
+                    exit_hit,
+                    balance + collateral + q * (fill_exit - entry) - fee_rate * mx.abs(q) * fill_exit,
+                    balance,
+                )
+                q = mx.where(exit_hit, 0.0, q)
+                entry = mx.where(exit_hit, 0.0, entry)
+                collateral = mx.where(exit_hit, 0.0, collateral)
 
             liq = (mx.abs(q) > EPS) & ((collateral + upnl) <= maint * notional)
             balance = mx.where(
@@ -255,7 +292,7 @@ class TradingEnv:
                 side = mx.where(mx.abs(a) > eff_thr, mx.sign(a), 0.0)
                 t = mx.abs(a)
 
-            side = mx.where(liq, 0.0, side)
+            side = mx.where(liq | exit_hit, 0.0, side)
 
             if goal_dim >= 3 and enforce_goal:
                 goal = state[:, 5:]
@@ -336,7 +373,10 @@ class TradingEnv:
             truncated = mx.where(mask, mx.zeros_like(truncated), truncated)
             done = mx.where(mask, mx.zeros_like(done), done)
 
-            return state2, steps2, done, key, obs, reward, done, truncated
+            exit_flag = mx.where(sl_hit, 2, mx.where(tp_hit, 1, mx.where(liq, 3, 0))).astype(mx.int32)
+            exit_flag = mx.where(mask, 0, exit_flag)
+
+            return state2, steps2, done, key, obs, reward, done, truncated, exit_flag
 
         t0 = time.time()
         self._step_fn = mx.compile(step)
@@ -350,19 +390,27 @@ class TradingEnv:
         tn_idx = mx.minimum(t_next, self.T - 1)
         price_prev = mx.take(self.closes_flat, self.sym_off + mx.minimum(t, self.T - 1))
         price = mx.take(self.closes_flat, self.sym_off + tn_idx)
+        high = price
+        low = price
+        if self.highs_flat is not None:
+            high = mx.take(self.highs_flat, self.sym_off + tn_idx)
+            low = mx.take(self.lows_flat, self.sym_off + tn_idx)
         feats = mx.take(self.feats2d, self.sym_off + tn_idx, axis=0)
-        state, steps, prev_done, key, obs, reward, done, truncated = self._step_fn(
+        state, steps, prev_done, key, obs, reward, done, truncated, exit_flag = self._step_fn(
             self._state, self._steps, self._prev_done, self._key, action,
-            price_prev, price, feats,
+            price_prev, price, high, low, feats,
         )
         self._step_count += 1
         if self._step_count % self.eval_every == 0:
-            mx.eval(state, steps, prev_done, obs, reward, done, truncated)
+            mx.eval(state, steps, prev_done, obs, reward, done, truncated, exit_flag)
         self._state = state
         self._steps = steps
         self._prev_done = prev_done
         self._key = key
-        return obs, reward.astype(mx.float32), done, {"timeouts": truncated.astype(mx.float32)}
+        return obs, reward.astype(mx.float32), done, {
+            "timeouts": truncated.astype(mx.float32),
+            "exit": exit_flag,
+        }
 
     def close(self):
         pass

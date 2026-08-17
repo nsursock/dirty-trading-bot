@@ -64,6 +64,26 @@ class DataBundle:
     ohlcv: OHLCV
     features: mx.array
     feature_names: tuple[str, ...] = FEATURES
+    high_ohlcv: OHLCV | None = None
+    high_features: mx.array | None = None
+    n_resample: int = 1
+
+
+def _resample(o: OHLCV, n: int) -> OHLCV:
+    """Aggregate every ``n`` low-TF bars into one high-TF bar (open/high/low/close/vol)."""
+    S, T = o.closes.shape
+    T_hi = T // n
+    if T_hi == 0:
+        raise ValueError(f"n_steps={T} too small for resample n={n}")
+    sl = T_hi * n
+    x = mx.reshape(o.closes[:, :sl], (S, T_hi, n))
+    return OHLCV(
+        opens=mx.reshape(o.opens[:, :sl], (S, T_hi, n))[:, :, 0],
+        highs=mx.max(mx.reshape(o.highs[:, :sl], (S, T_hi, n)), axis=-1),
+        lows=mx.min(mx.reshape(o.lows[:, :sl], (S, T_hi, n)), axis=-1),
+        closes=x[:, :, -1],
+        vols=mx.sum(mx.reshape(o.vols[:, :sl], (S, T_hi, n)), axis=-1),
+    )
 
 
 def _lag(x: mx.array, k: int) -> mx.array:
@@ -111,14 +131,20 @@ def _features(o: OHLCV) -> mx.array:
     c, h, l, v = o.closes, o.highs, o.lows, o.vols
     logc = mx.log(c)
     r1 = logc - _lag(logc, 1)
+    T = c.shape[1]
+
+    def lag(x, k):
+        k = max(min(k, max(T - 1, 1)), 1)
+        return _lag(x, k)
+
     ema20 = _ewm(c, 2.0 / 21.0)
     ema_v = _ewm(v, 2.0 / 21.0)
     return mx.stack(
         [
             r1,
-            logc - _lag(logc, 5),
-            logc - _lag(logc, 10),
-            logc - _lag(logc, 20),
+            logc - lag(logc, 5),
+            logc - lag(logc, 10),
+            logc - lag(logc, 20),
             c / (ema20 + EPS) - 1.0,
             _macd(c) / (c + EPS),
             (_rsi(c) - 50.0) / 50.0,
@@ -139,13 +165,21 @@ def generate(
     symbols: dict[str, tuple[float, float, float]] | None = None,
     n_steps: int = 2520,
     seed: int = 42,
-    dt: float = 1.0 / TRADING_DAYS,
+    low_tf: int = 5,
+    high_tf: int = 240,
     base_volume: float = 1_000_000.0,
+    dt: float | None = None,
 ) -> DataBundle:
     params = SYMBOLS if symbols is None else symbols
     names = tuple(params)
     keys = mx.random.split(mx.random.key(seed), len(names))
-    log.info("data: generating %d symbols x %d steps (seed=%d, dt=%.6f)", len(names), n_steps, seed, dt)
+    if dt is None:
+        dt = low_tf / (60 * 24 * TRADING_DAYS)
+    n = max(int(high_tf) // int(low_tf), 1)
+    log.info(
+        "data: generating %d symbols x %d low-TF(%dm) steps, high-TF(%dm) x%d (seed=%d, dt=%.2e)",
+        len(names), n_steps, low_tf, high_tf, n, seed, dt,
+    )
 
     arrays = {k: [] for k in ("opens", "highs", "lows", "closes", "vols")}
     for i, name in enumerate(tqdm(names, desc="symbols", leave=False)):
@@ -169,5 +203,10 @@ def generate(
         vols=mx.concatenate(arrays["vols"], axis=0),
     )
     feats = _features(ohlcv)
-    log.debug("data: feature tensor %s (%d features)", feats.shape, len(FEATURES))
-    return DataBundle(symbols=names, ohlcv=ohlcv, features=feats)
+    high_ohlcv = _resample(ohlcv, n) if n > 1 else ohlcv
+    high_features = _features(high_ohlcv) if n > 1 else feats
+    log.debug("data: low features %s, high features %s (n_resample=%d)", feats.shape, high_features.shape, n)
+    return DataBundle(
+        symbols=names, ohlcv=ohlcv, features=feats,
+        high_ohlcv=high_ohlcv, high_features=high_features, n_resample=n,
+    )

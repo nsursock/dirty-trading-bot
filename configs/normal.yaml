@@ -3,7 +3,9 @@ seed: 42
 data:
   n_symbols: 8
   n_steps: 2520
-  dt_days: 252
+  timeframes:
+    low: 5
+    high: 240
 
 env:
   n_envs_per_symbol: 64
@@ -18,6 +20,8 @@ env:
   max_collateral: 10000.0
   risk_min: 0.01
   risk_max: 0.05
+  take_profit: 0.05
+  stop_loss: 0.03
   enforce_goal: false
   initial_balance: 1000.0
   size_fraction: 1.0
@@ -28,6 +32,13 @@ reward:
   mode: normal
   drawdown_penalty: 1.0
   reward_clip: 10.0
+
+norm:
+  norm_obs: true
+  norm_reward: true
+  clip_obs: 10.0
+  clip_reward: 10.0
+  gamma: 0.99
 
 report:
   theme: synthwave
@@ -44,7 +55,7 @@ manager:
   learning_rate: 0.0003
   n_steps: 256
   batch_size: 64
-  n_epochs: 10
+  n_epochs: 4
   gamma: 0.99
   gae_lambda: 0.95
   clip_range: 0.2
