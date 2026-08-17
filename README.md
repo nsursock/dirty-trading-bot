@@ -149,7 +149,7 @@ scripts/
   bench.py     # milestone benchmark harness
 utils/
   inspect_data.py  # OHLCV -> PNG
-configs/       # smoke.yaml, normal.yaml
+configs/       # smoke.yaml, normal.yaml, scalp.yaml, day.yaml, swing.yaml
 sota/          # literature notes (backtesting, microstructure, ...)
 ```
 
