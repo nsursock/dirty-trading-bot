@@ -4,8 +4,8 @@ data:
   n_symbols: 8
   n_steps: 2520
   timeframes:
-    low: 5
-    high: 240
+    low: 5m
+    high: 4h
   regime: mix
 
 env:

@@ -28,6 +28,31 @@ log = logging.getLogger("trading")
 TRADING_DAYS = 252
 EPS = 1e-12
 
+# Binance klines v3 intervals (as returned by GET /api/v3/klines).
+BINANCE_TFS: frozenset[str] = frozenset(
+    {
+        "1m", "3m", "5m", "15m", "30m",
+        "1h", "2h", "4h", "6h", "8h", "12h",
+        "1d", "3d",
+        "1w",
+        "1M",
+    }
+)
+
+
+def _tf_minutes(tf: int | str) -> int:
+    """Convert a Binance klines v3 interval like ``"4h"`` to minutes.
+
+    Integers are accepted as minutes for backward compatibility.
+    """
+    if isinstance(tf, int):
+        return tf
+    if not isinstance(tf, str) or tf not in BINANCE_TFS:
+        raise ValueError(f"unknown Binance timeframe: {tf!r} (want one of {sorted(BINANCE_TFS)})")
+    v, unit = int(tf[:-1]), tf[-1]
+    scale = {"m": 1, "h": 60, "d": 60 * 24, "w": 60 * 24 * 7, "M": 60 * 24 * 30}
+    return v * scale[unit]
+
 SYMBOLS: dict[str, tuple[float, float, float]] = {
     "BTC": (0.30, 0.60, 60_000.0),
     "ETH": (0.35, 0.75, 3_000.0),
@@ -165,8 +190,8 @@ def generate(
     symbols: dict[str, tuple[float, float, float]] | None = None,
     n_steps: int = 2520,
     seed: int = 42,
-    low_tf: int = 5,
-    high_tf: int = 240,
+    low_tf: int | str = "5m",
+    high_tf: int | str = "4h",
     base_volume: float = 1_000_000.0,
     regime: str = "bull",
     dt: float | None = None,
@@ -174,9 +199,11 @@ def generate(
     params = SYMBOLS if symbols is None else symbols
     names = tuple(params)
     keys = mx.random.split(mx.random.key(seed), len(names))
+    low_min = _tf_minutes(low_tf)
+    high_min = _tf_minutes(high_tf)
     if dt is None:
-        dt = low_tf / (60 * 24 * TRADING_DAYS)
-    n = max(int(high_tf) // int(low_tf), 1)
+        dt = low_min / (60 * 24 * TRADING_DAYS)
+    n = max(high_min // low_min, 1)
 
     mus = [params[s][0] for s in names]
     sigmas = [params[s][1] for s in names]
@@ -191,8 +218,8 @@ def generate(
     params = {s: (mus[i], sigmas[i], s0s[i]) for i, s in enumerate(names)}
 
     log.info(
-        "data: generating %d symbols x %d low-TF(%dm) steps, high-TF(%dm) x%d, regime=%s (seed=%d, dt=%.2e)",
-        len(names), n_steps, low_tf, high_tf, n, regime, seed, dt,
+        "data: generating %d symbols x %d low-TF(%sm) steps, high-TF(%sm) x%d, regime=%s (seed=%d, dt=%.2e)",
+        len(names), n_steps, low_min, high_min, n, regime, seed, dt,
     )
 
     arrays = {k: [] for k in ("opens", "highs", "lows", "closes", "vols")}
