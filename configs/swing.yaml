@@ -27,7 +27,7 @@ env:
   initial_balance: 1000.0
   size_fraction: 1.0
   side_threshold: 0.2
-  trade_knob: 2.0
+  trade_knob: 8.5
 
 reward:
   mode: normal
