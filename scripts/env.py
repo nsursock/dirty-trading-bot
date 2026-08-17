@@ -167,7 +167,6 @@ class TradingEnv:
     def _build_step(self):
         num_envs = self.num_envs
         T = self.T
-        closes_flat = self.closes_flat
         feats2d = self.feats2d
         sym_off = self.sym_off
         goal_dim = self.goal_dim
@@ -197,16 +196,12 @@ class TradingEnv:
             ],
             axis=1,
         )
+        mx.eval(obs_static0, reset_acct)
 
-        def step(state, steps, prev_done, key, action):
+        def step(state, steps, prev_done, key, action, price_prev, price, feats):
             mask = prev_done
             t = mx.where(mask, mx.zeros_like(steps), steps)
             t_next = t + 1
-            t_idx = mx.minimum(t, T - 1)
-            tn_idx = mx.minimum(t_next, T - 1)
-
-            price_prev = mx.take(closes_flat, sym_off + t_idx)
-            price = mx.take(closes_flat, sym_off + tn_idx)
 
             balance = state[:, 0]
             q = state[:, 1]
@@ -287,7 +282,6 @@ class TradingEnv:
                 goal = state[:, 5:]
                 state2 = mx.concatenate([state2, goal], axis=1)
 
-            feats = mx.take(feats2d, sym_off + tn_idx, axis=0)
             pos = mx.stack([mx.abs(q) <= EPS, q > EPS, q < -EPS], axis=1).astype(mx.float32)
             acct = mx.stack(
                 [
@@ -321,8 +315,15 @@ class TradingEnv:
     def step(self, action):
         if self._step_fn is None:
             self._build_step()
+        t = mx.where(self._prev_done, mx.zeros_like(self._steps), self._steps)
+        t_next = t + 1
+        tn_idx = mx.minimum(t_next, self.T - 1)
+        price_prev = mx.take(self.closes_flat, self.sym_off + mx.minimum(t, self.T - 1))
+        price = mx.take(self.closes_flat, self.sym_off + tn_idx)
+        feats = mx.take(self.feats2d, self.sym_off + tn_idx, axis=0)
         state, steps, prev_done, key, obs, reward, done, truncated = self._step_fn(
-            self._state, self._steps, self._prev_done, self._key, action
+            self._state, self._steps, self._prev_done, self._key, action,
+            price_prev, price, feats,
         )
         self._step_count += 1
         if self._step_count % self.eval_every == 0:

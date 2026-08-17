@@ -62,9 +62,15 @@ def _train(cfg, run_dir: Path, log) -> JointHRL:
     train_dir = run_dir / "training"
     train_dir.mkdir(parents=True, exist_ok=True)
     log.info("training start: total_timesteps=%s", cfg.get("train", {}).get("total_timesteps"))
+    j = None
     try:
         j = JointHRL(cfg, log_dir=str(train_dir))
         j.learn(log_interval=cfg.get("train", {}).get("log_interval", 1))
+    except KeyboardInterrupt:
+        log.warning("training interrupted by user; saving checkpoint")
+        if j is not None:
+            j.save(train_dir)
+        raise
     except Exception as e:
         log.exception("training failed: %s", e)
         raise

@@ -104,6 +104,7 @@ class JointHRL:
 
     def __init__(self, cfg, log_dir=None):
         self.cfg = cfg
+        self.log_dir = log_dir
         self.bundle = build_bundle(cfg)
         h = dict(cfg.get("hrl", {}))
         self.goal_dim = h.get("goal_dim", 3)
@@ -129,7 +130,7 @@ class JointHRL:
         log.info("worker: SAC replay buffer = %d transitions ~= %.1f MB",
                  wrk_cfg.get("buffer_size", 10_000), buf_bytes / 1e6)
 
-    def learn(self, total_timesteps=None, log_interval=1, on_iter=None):
+    def learn(self, total_timesteps=None, log_interval=1, on_iter=None, checkpoint_every=300):
         cfg = self.cfg
         total = total_timesteps if total_timesteps is not None else cfg.get("train", {}).get(
             "total_timesteps", 4096
@@ -165,6 +166,7 @@ class JointHRL:
         pbar = tqdm(total=total, desc="train", unit="env-step")
         iteration = 0
         sac_started = False
+        last_ckpt = time.time()
         while sac.num_timesteps < total:
             ppo.buffer.reset()
             cycle_win = mx.zeros((n_envs,))
@@ -258,6 +260,11 @@ class JointHRL:
                 )
                 ppo.dump_logs(iteration)
                 sac.dump_logs(iteration)
+
+            if self.log_dir and time.time() - last_ckpt >= checkpoint_every:
+                self.save(self.log_dir)
+                log.info("checkpoint saved: timesteps=%d", sac.num_timesteps)
+                last_ckpt = time.time()
 
         pbar.close()
         log.info("training done: total_timesteps=%d", sac.num_timesteps)
