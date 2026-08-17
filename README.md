@@ -187,27 +187,33 @@ worker rollout into a single `mx.compile` graph, and the full 20-minute
 
 ## Environment scaling sweep
 
-Joint-loop throughput (rollout + PPO + SAC) and peak Metal memory vs. `n_envs`,
-doubling each step on the `normal.yaml` config (8 symbols, M3 Air 16 GB):
+Joint-loop throughput (rollout + PPO + SAC) and peak Metal memory vs. `n_envs`
+on the `normal.yaml` config (8 symbols, SAC `[256,256]`, PPO `[128,128]`, 1M
+replay; M3 Air 16 GB). Each point is the **mean over steady-state cycles**
+(first 2 warmup/JIT cycles discarded), so these are sustained numbers, not
+single-cycle samples:
 
-| n_envs | steps/sec | peak Metal (GB) | scaling eff. |
+| n_envs | steps/sec (mean ± std) | peak Metal (GB) | scaling eff. |
 | ---: | ---: | ---: | ---: |
-| 16 | 15,339 | 0.26 | — |
-| 32 | 32,358 | 0.29 | 105% |
-| 64 | 68,263 | 0.36 | 105% |
-| 128 | 119,767 | 0.50 | 88% |
-| 256 | 234,577 | 0.77 | 98% |
-| 512 | 405,944 | 1.16 | 87% |
-| 1024 | 669,777 | 1.49 | 82% |
-| 2048 | 1,024,296 | 2.04 | 76% |
-| 4096 | 1,258,442 | 3.03 | 61% |
-| 8192 | 1,370,609 | 5.06 | 54% |
+| 256 | 329,954 ± 5,137 | 0.81 | — |
+| 512 | 570,223 ± 6,357 | 1.23 | 86% |
+| 1024 | 853,830 ± 39,514 | 1.61 | 75% |
+| 2048 | 1,143,600 ± 26,351 | 2.27 | 67% |
+| 4096 | 1,264,005 ± 7,302 | 3.46 | 55% |
 
-- **FPS plateaus** at ~1.3–1.4M steps/sec around 4096–8192 envs (+9% from
-  4096→8192, scaling efficiency collapsed to 54%).
-- **Memory never swapped** — peak Metal memory 5.06 GB at 8192 envs, process
-  RSS steady ~0.3 GB. The binding constraint is **compute** (gradient updates +
-  per-step dispatch), not memory.
-- **FPS/GB sweet spot ≈ 1024–2048 envs** (~450–500k steps/sec per GB); the
-  default 512-env `normal.yaml` sits comfortably on the linear region with
-  plenty of headroom.
+- **FPS plateaus at ~1.26M steps/sec around 4096 envs** (only ~11% more than
+  2048). The earlier single-cycle sweep slightly *understated* steady-state
+  throughput and showed a spurious super-linear bump at small `n_envs` — both
+  were warmup artifacts.
+- **Memory never swaps** — peak Metal memory 3.46 GB at 4096 envs, process RSS
+  steady ~0.3 GB. The binding constraint is **compute**, not memory.
+- **Bottleneck is the PPO update** (profiled at 2048 envs): ~1.8 s of a ~3.7 s
+  cycle, because its minibatch is `n_steps × n_envs`, so it grows with env
+  count. env.step (~0.48 s), SAC update (~0.04 s), and manager policy (~0.01 s)
+  are all negligible by comparison.
+- A **~3–14% within-run FPS decline** is visible over each point's cycles (a
+  few tens of seconds) — consistent with the Air's passive thermal throttling.
+  The 20-minute `powermetrics` thermal gate remains the outstanding check.
+- **FPS/GB sweet spot ≈ 1024–2048 envs** (~530–500k steps/sec per GB); the
+  default 512-env `normal.yaml` sits comfortably on the efficient region with
+  headroom.
