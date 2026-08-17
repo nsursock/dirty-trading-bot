@@ -21,11 +21,13 @@ env:
   max_collateral: 10000.0
   risk_min: 0.01
   risk_max: 0.1
+  take_profit: 0.02
+  stop_loss: 0.015
   enforce_goal: false
   initial_balance: 1000.0
   size_fraction: 1.0
   side_threshold: 0.2
-  trade_knob: 1.5
+  trade_knob: 6.0
 
 reward:
   mode: normal
@@ -63,7 +65,7 @@ manager:
   net_arch: [128, 128]
 
 worker:
-  learning_rate: 0.0003
+  learning_rate: 0.001
   buffer_size: 1000000
   learning_starts: 4096
   batch_size: 256
@@ -71,5 +73,5 @@ worker:
   gamma: 0.99
   train_freq: 1
   gradient_steps: 1
-  ent_coef: auto
+  ent_coef: 0.2
   net_arch: [256, 256]
