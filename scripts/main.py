@@ -4,8 +4,9 @@
     python main.py test   [--checkpoint logs/<ts>/training]
     python main.py full   [--config configs/normal.yaml]
 
-Writes a timestamped run folder ``logs/<timestamp>/`` with ``run.log`` at its
-root (WARN/ERROR only) and ``training/`` / ``testing/`` artifacts beneath.
+Writes a timestamped run folder ``logs/<timestamp>/`` with a copy of the
+source YAML (original filename), ``run.log`` at its root, and ``training/`` /
+``testing/`` artifacts beneath.
 Screen output is limited to tqdm progress bars.
 """
 
@@ -13,13 +14,14 @@ from __future__ import annotations
 
 import argparse
 import logging
+import shutil
 from datetime import datetime
 from pathlib import Path
 
 import mlx.core as mx  # noqa: F401  (ensure mlx import before dirty_mlx_ml)
 
 from agents import JointHRL
-from config import load, load_smoke
+from config import load
 from report import generate_report, ml_health
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -44,8 +46,14 @@ def _setup_logging(run_dir: Path) -> logging.Logger:
     return logger
 
 
-def _load_cfg(args) -> dict:
-    return load(args.config) if args.config else load_smoke()
+def _config_path(args) -> Path:
+    return Path(args.config) if args.config else ROOT / "configs" / "smoke.yaml"
+
+
+def _copy_config(src: Path, run_dir: Path) -> Path:
+    dst = run_dir / src.name
+    shutil.copy2(src, dst)
+    return dst
 
 
 def _save(j: JointHRL, train_dir: Path) -> Path:
@@ -102,8 +110,11 @@ def main():
 
     run_dir = _run_dir()
     log = _setup_logging(run_dir)
-    cfg = _load_cfg(args)
+    src = _config_path(args)
+    cfg = load(src)
+    copied = _copy_config(src, run_dir)
     log.info("run started: mode=%s run_dir=%s", args.mode, run_dir)
+    log.info("config copied: %s -> %s", src, copied)
     log.debug("config: %s", dict(cfg) if hasattr(cfg, "items") else cfg)
 
     if args.mode == "train":
