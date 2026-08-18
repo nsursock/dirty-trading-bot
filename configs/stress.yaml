@@ -9,7 +9,7 @@ data:
   regime: mix
 
 env:
-  n_envs_per_symbol: 2048   # 8 x 1024 = 8192 parallel envs (stress / plateau region)
+  n_envs_per_symbol: 2048   # 8 x 2048 = 16384 parallel envs (stress / plateau region)
   lev_min: 50.0   # floor leverage high so every open starts near the steep liq curve
   lev_max: 150.0
   open_fee_rate: 0.0003

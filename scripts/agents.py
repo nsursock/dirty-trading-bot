@@ -29,6 +29,22 @@ from env import TradingEnv
 
 log = logging.getLogger("trading")
 
+# Bound the MLX allocator cache per process (memory-handling lever 1).
+# Training's live footprint is small (~0.8 GB at 16K envs), but the allocator
+# cache otherwise grows ~10x larger during gradient training and never returns
+# those freed tensors to Metal/OS — on the 16 GB Mac this swap-kills parallel
+# ``full`` runs. A ~2 GB cap costs <1% FPS (measured) and lets several jobs
+# share RAM. Override with MLX_CACHE_LIMIT_MB.
+MLX_CACHE_LIMIT_MB = int(os.environ.get("MLX_CACHE_LIMIT_MB", "2048"))
+
+
+def _cap_allocator_cache() -> None:
+    """Apply the process-wide MLX cache limit once, before any big allocations."""
+    mx.set_cache_limit(MLX_CACHE_LIMIT_MB * 1024 * 1024)
+
+
+_cap_allocator_cache()
+
 
 def _plain(obj):
     """Recursively unwrap Config -> plain dict/list so yaml can dump it."""
@@ -204,6 +220,7 @@ class JointHRL:
         buf_bytes = wrk_cfg.get("buffer_size", 10_000) * (2 * obs_dim + 1 + 3) * 4
         log.info("worker: SAC replay buffer = %d transitions ~= %.1f MB",
                  wrk_cfg.get("buffer_size", 10_000), buf_bytes / 1e6)
+        log.info("mlx: allocator cache limit = %d MB", MLX_CACHE_LIMIT_MB)
 
     def learn(self, total_timesteps=None, log_interval=1, on_iter=None, checkpoint_every=300, log_every=0):
         cfg = self.cfg
@@ -318,6 +335,10 @@ class JointHRL:
             last_values = ppo.policy.forward(mgr_obs)[1]
             ppo.buffer.compute_returns_and_advantage(last_values, mgr_starts)
             ppo.train()
+            # Memory-handling lever 2: release the rollout + gradient tensors
+            # freed during this cycle so the allocator cache does not keep the
+            # whole cycle's graph alive across iterations.
+            mx.clear_cache()
 
             iteration += 1
             self.last_ep_rew_mean = float(mx.sum(cycle_win)) / max(n_steps * n_envs, 1)
