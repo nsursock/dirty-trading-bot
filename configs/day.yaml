@@ -9,7 +9,7 @@ data:
   regime: mix
 
 env:
-  n_envs_per_symbol: 1024
+  n_envs_per_symbol: 256
   lev_min: 2.0
   lev_max: 20.0
   open_fee_rate: 0.0003
