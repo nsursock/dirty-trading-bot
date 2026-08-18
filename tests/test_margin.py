@@ -125,8 +125,8 @@ def test_breakdown_roe_uses_collateral_basis(tmp_path):
 
     text = breakdown(res, tmp_path / "bd.txt", Config({"returns": {"basis": "collateral"}}))
     assert "By return" in text
-    assert "multi-R (>=10%)" in text  # 50 pnl / 100 collateral = +50% RoC
+    assert "multi-R (>=100 bps)" in text  # 50 pnl / 100 collateral = +50% RoC = 5000 bps
 
     text2 = breakdown(res, tmp_path / "bd2.txt", Config({"returns": {"basis": "account"}}))
     assert "By RoE" in text2
-    assert "single-R (1-10%)" in text2  # 50 pnl / 1000 account equity = +5% RoE
+    assert "multi-R (>=100 bps)" in text2  # 50 pnl / 1000 account equity = +5% = 500 bps

@@ -137,15 +137,18 @@ def run_test(cfg, manager, worker, norm_state=None, seed_offset=1) -> dict:
     open_trades = [None] * n_envs
     ledger = []
     prev_side = np.zeros(n_envs, dtype=int)
-    cum_fee = np.zeros(n_envs)
+
+    # Ledger-derived bookkeeping: reported curves (net/gross/roc/per-symbol)
+    # are built from the ledger (trades.csv), not from the live env poll, so
+    # txt/png always reconcile with the history CSV. Realized equity steps
+    # only at trade closes; open positions contribute nothing until closed.
+    book = np.full(n_envs, init_bal, dtype=float)
+    fees_paid = np.zeros(n_envs, dtype=float)
+    fund_paid = np.zeros(n_envs, dtype=float)
 
     net_curve, gross_curve, step_axis = [], [], []
-    symbol_eq = []
     lev_all, coll_all, sides_all, exits = [], [], [], []
     trade_id = 0
-    roc_curve = []
-    eq_prev = np.full(n_envs, init_bal, dtype=float)
-    coll_prev = np.zeros(n_envs)
 
     t = 0
     pbar = tqdm(total=T - 1, desc=f"test seed+{seed_offset}", unit="step",
@@ -181,77 +184,92 @@ def run_test(cfg, manager, worker, norm_state=None, seed_offset=1) -> dict:
 
             for i in range(n_envs):
                 if prev_side[i] == 0 and side[i] != 0:
+                    qty = float(notional[i] / (price[i] + 1e-9)) * (1.0 if side[i] > 0 else -1.0)
                     open_trades[i] = {
                         "trade_id": trade_id,
                         "symbol": symbols[sym_idx[i]],
                         "side": "long" if side[i] > 0 else "short",
                         "opened_at": t,
                         "entry_price": float(price[i]),
+                        "qty": qty,
                         "notional": float(notional[i]),
                         "leverage": float(notional[i] / (collateral[i] + 1e-9)),
                         "collateral": float(collateral[i]),
                         "equity_before": float(equity[i]),
                         "fee": fee_rate * notional[i],
+                        "funding": 0.0,
                         "exit_type": "open",
                     }
                     trade_id += 1
-                    cum_fee[i] += fee_rate * notional[i]
                 elif prev_side[i] != 0 and side[i] == 0:
                     tr = open_trades[i]
-                    realized = float(equity[i] - tr["equity_before"])
+                    exit_price = float(price[i])
                     exit_type = _EXIT_NAMES.get(int(exit_flags[i]),
                                                 "market_close" if req[i] == 0 else "liquidation")
                     if tr is not None:
-                        ledger.append(
-                            _finish_trade(tr, float(price[i]), t, exit_type, fee_rate * notional[i], realized)
-                        )
+                        if exit_type == "liquidation":
+                            # Isolated margin: liquidation loses the full
+                            # collateral, no more (pnl % capped at -100%).
+                            # Funding/fees stay on their own cost columns.
+                            realized = -float(tr["collateral"])
+                            exit_fee = 0.0
+                        else:
+                            exit_fee = fee_rate * abs(tr["qty"]) * exit_price
+                            realized = (tr["qty"] * (exit_price - tr["entry_price"])
+                                        - tr["fee"] - exit_fee - tr["funding"])
+                        ledger.append(_finish_trade(tr, exit_price, t, exit_type, exit_fee, realized))
+                        book[i] += realized
+                        fees_paid[i] += tr["fee"]
+                        fund_paid[i] += tr["funding"]
                     open_trades[i] = None
                     exits.append(exit_type)
-                    cum_fee[i] += fee_rate * abs(tr["notional"]) if tr else 0.0
                 elif prev_side[i] != 0 and side[i] != prev_side[i]:
                     tr = open_trades[i]
+                    exit_price = float(price[i])
                     if tr is not None:
-                        realized = float(equity[i] - tr["equity_before"])
-                        ledger.append(
-                            _finish_trade(tr, float(price[i]), t, "market_close", fee_rate * notional[i], realized)
-                        )
+                        realized = (tr["qty"] * (exit_price - tr["entry_price"])
+                                    - tr["fee"]
+                                    - fee_rate * abs(tr["qty"]) * exit_price
+                                    - tr["funding"])
+                        ledger.append(_finish_trade(tr, exit_price, t, "market_close",
+                                                    fee_rate * abs(tr["qty"]) * exit_price, realized))
                         exits.append("market_close")
+                        book[i] += realized
+                        fees_paid[i] += tr["fee"]
+                        fund_paid[i] += tr["funding"]
+                    qty = float(notional[i] / (price[i] + 1e-9)) * (1.0 if side[i] > 0 else -1.0)
                     open_trades[i] = {
                         "trade_id": trade_id,
                         "symbol": symbols[sym_idx[i]],
                         "side": "long" if side[i] > 0 else "short",
                         "opened_at": t,
                         "entry_price": float(price[i]),
+                        "qty": qty,
                         "notional": float(notional[i]),
                         "leverage": float(notional[i] / (collateral[i] + 1e-9)),
                         "equity_before": float(equity[i]),
                         "fee": fee_rate * notional[i],
+                        "funding": 0.0,
                         "exit_type": "open",
                     }
                     trade_id += 1
 
-                cum_fee[i] += funding * notional[i]
                 if side[i] != 0:
                     lev_all.append(notional[i] / (collateral[i] + 1e-9))
                     coll_all.append(collateral[i])
                     sides_all.append("long" if side[i] > 0 else "short")
+                if open_trades[i] is not None:
+                    # Signed funding: the env does `balance -= funding * (q*price)`,
+                    # so longs pay (+cost) and shorts receive (-cost).
+                    open_trades[i]["funding"] += funding * notional[i] * float(side[i])
 
             prev_side = side
             step_axis.append(t)
-            # Portfolio equity = mean across accounts (each env starts at the
-            # config initial_balance, so the mean curve tracks one $1000 book).
-            net_curve.append(float(np.mean(equity)))
-            gross_curve.append(float(np.mean(equity + cum_fee)))
-            symbol_eq.append(np.asarray(equity))
-
-            # Collateral-basis portfolio return for this bar:
-            # bar PnL aggregated over the accounts, divided by the collateral
-            # those accounts had deployed at the start of the bar (0 when flat).
-            bar_pnl = float(np.sum(equity - eq_prev))
-            bar_coll = float(np.sum(coll_prev))
-            roc_curve.append(bar_pnl / (bar_coll + 1e-12) if bar_coll > 1e-6 else 0.0)
-            eq_prev = equity
-            coll_prev = collateral
+            # Portfolio equity = mean of the per-account realized books (each
+            # env starts at the config initial_balance, so the mean curve
+            # tracks one $1000 book that steps only when trades close).
+            net_curve.append(float(np.mean(book)))
+            gross_curve.append(float(np.mean(book + fees_paid + fund_paid)))
             pbar.n = t
             pbar.refresh()
 
@@ -263,12 +281,30 @@ def run_test(cfg, manager, worker, norm_state=None, seed_offset=1) -> dict:
     pbar.close()
     log.debug("test rollout done: steps=%d trades=%d final_equity=%.4f", t, len(ledger), net_curve[-1])
     sym_by_env = np.asarray(sym_idx)
-    per_symbol = None
-    if symbol_eq:
-        # (num_envs, T_steps) -> average across position-slots -> (n_symbols, T_steps)
-        per_symbol = np.stack(symbol_eq, axis=1)
-        if env.n_envs_per_symbol > 1:
-            per_symbol = np.stack([per_symbol[sym_by_env == s].mean(axis=0) for s in range(S)])
+
+    # Ledger-driven per-symbol equity (realized) and collateral-basis ROC.
+    # Each symbol's curve is its cumulative realized PnL scaled back to a
+    # single account (divide by the number of position slots per symbol).
+    #
+    # ROC at a bar is the realized PnL of trades *closing* that bar divided by
+    # the collateral of those same trades (not all open collateral): a full
+    # liquidation then reads as a ~-100% bar return instead of being diluted
+    # by the collateral of still-open positions.
+    sym_index = {sym: k for k, sym in enumerate(symbols)}
+    T_bars = len(step_axis)
+    roc_realized = np.zeros(T_bars, dtype=float)
+    roc_coll = np.zeros(T_bars, dtype=float)
+    sym_real = np.zeros((S, T_bars), dtype=float)
+    for tr in ledger:
+        ca = int(tr["closed_at"])
+        realized = float(tr.get("realized_pnl", 0.0) or 0.0)
+        coll = float(tr.get("collateral", 0.0) or 0.0)
+        roc_realized[ca] += realized
+        roc_coll[ca] += coll
+        sym_real[sym_index[tr["symbol"]], ca] += realized
+    roc_curve = np.where(roc_coll > 1e-6, roc_realized / np.maximum(roc_coll, 1e-9), 0.0)
+    n_per = max(int(env.n_envs_per_symbol), 1)
+    per_symbol = init_bal + np.cumsum(sym_real, axis=1) / n_per
     return {
         "ledger": ledger,
         "net": np.asarray(net_curve),
@@ -277,6 +313,8 @@ def run_test(cfg, manager, worker, norm_state=None, seed_offset=1) -> dict:
         "per_symbol": per_symbol,
         "sym_by_env": sym_by_env,
         "roc": np.asarray(roc_curve),
+        "roc_realized": roc_realized,
+        "roc_coll": roc_coll,
         "leverage": np.asarray(lev_all),
         "collateral": np.asarray(coll_all),
         "sides": sides_all,
@@ -305,7 +343,7 @@ def _sort_ledger(ledger):
 def write_ledger(ledger, path):
     cols = [
         "trade_id", "episode", "symbol", "side", "opened_at", "closed_at", "entry_price",
-        "exit_price", "notional", "leverage", "collateral", "fee", "realized_pnl", "exit_type",
+        "exit_price", "notional", "leverage", "collateral", "fee", "funding", "realized_pnl", "exit_type",
     ]
     with open(path, "w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=cols, extrasaction="ignore")
@@ -496,10 +534,15 @@ def _config_lines(cfg) -> list[str]:
     r = cfg.get("reward", {})
     h = cfg.get("hrl", {})
     w = cfg.get("worker", {})
+    ev = cfg.get("eval", {})
+    n_sym = int(d.get("n_symbols", 0) or 0)
+    # The eval rollout uses max_positions_per_symbol position slots per symbol
+    # (see _test_env), not the training n_envs_per_symbol.
+    per_sym = max(1, int(ev.get("max_positions_per_symbol", 1)))
     return [
         f"seed: {cfg.get('seed')}",
         f"symbols: {d.get('n_symbols')}  steps: {d.get('n_steps')}  dt_days: {d.get('dt_days')}",
-        f"env: {d.get('n_symbols')} symbols x {e.get('n_envs_per_symbol')} = {d.get('n_symbols',0)*e.get('n_envs_per_symbol',0)} envs  "
+        f"env: {n_sym} symbols x {per_sym} = {n_sym * per_sym} test envs  "
         f"lev {e.get('lev_min')}–{e.get('lev_max')}x  risk {float(e.get('risk_min',0))*100:.0f}–{float(e.get('risk_max',0))*100:.0f}%  "
         f"eq={e.get('initial_balance')}  fee={e.get('fee_rate')}  funding={e.get('funding_rate')}",
         f"reward: {r.get('mode')}  dd_pen={r.get('drawdown_penalty')}  clip={r.get('reward_clip')}  trade_knob={e.get('trade_knob')}",
@@ -509,11 +552,13 @@ def _config_lines(cfg) -> list[str]:
 
 
 def _trade_stats(trades, base=1000.0):
-    """Descriptive per-trade stats (NOT annualized as a return series).
+    """Descriptive per-trade stats.
 
-    Sharpe / Sortino / Calmar are reported only at portfolio level from the
-    bar-indexed net curve (see ``breakdown``); per-trade subgroups return 0
-    for those three columns so no fake ``sqrt(n)`` annualization leaks in.
+    ``max_dd`` is the peak-to-trough drawdown of the trade-PnL cumsum scaled by
+    the total account capital in play (``n_accounts * base``), so a subgroup
+    spanning N accounts does not read as an N-fold drawdown. Sharpe / Sortino /
+    Calmar are per-trade (NOT annualized): mean/std, mean/downside-std, and
+    total-return/max-drawdown respectively.
     """
     pnls = np.array([float(t.get("realized_pnl", 0.0) or 0.0) for t in trades], dtype=float)
     n = int(pnls.size)
@@ -525,16 +570,24 @@ def _trade_stats(trades, base=1000.0):
     win_rate = 100.0 * float((pnls > 0).mean())
     avg_win = float(wins.mean()) if wins.size else 0.0
     avg_loss = float(losses.mean()) if losses.size else 0.0
+    accts = {(int(t.get("episode", 0) or 0), str(t.get("symbol", ""))) for t in trades}
+    n_accts = max(len(accts), 1)
     cum = np.cumsum(pnls)
     peak = np.maximum.accumulate(cum)
     dd_min = float((cum - peak).min())
-    max_dd = 100.0 * abs(dd_min) / max(abs(base), 1.0) if abs(dd_min) > 1e-9 else 0.0
+    max_dd = 100.0 * abs(dd_min) / max(abs(base) * n_accts, 1.0) if abs(dd_min) > 1e-9 else 0.0
     rr = avg_win / abs(avg_loss) if losses.size and abs(avg_loss) > 1e-12 else 0.0
     gw = float(wins.sum()) if wins.size else 0.0
     gl = float(abs(losses.sum())) if losses.size else 0.0
     pf = gw / gl if gl > 1e-12 else (999.0 if gw > 0 else 0.0)
+    std = float(pnls.std())
+    sharpe = float(pnls.mean()) / std if n > 1 and std > 1e-12 else 0.0
+    dstd = float(losses.std()) if losses.size > 1 else 0.0
+    sortino = float(pnls.mean()) / dstd if dstd > 1e-12 else 0.0
+    total_ret = net / max(abs(base) * n_accts, 1.0)
+    calmar = total_ret / (max_dd / 100.0) if max_dd > 1e-9 else 0.0
     return dict(num=n, win_rate=win_rate, avg_win=avg_win, avg_loss=avg_loss, net=net,
-                sharpe=0.0, max_dd=max_dd, rr=rr, sortino=0.0, calmar=0.0, pf=pf)
+                sharpe=sharpe, max_dd=max_dd, rr=rr, sortino=sortino, calmar=calmar, pf=pf)
 
 
 def _bd_row(label, st):
@@ -549,15 +602,16 @@ def _bd_table(title, groups, portfolio):
     for label, st in groups:
         rows.append(_bd_row(label, st))
     rows.append(_bd_row("portfolio", portfolio))
-    return [title, "", tabulate(rows, headers="firstrow", tablefmt="github", floatfmt=".4f"), ""]
+    return [title, "", tabulate(rows, headers="firstrow", tablefmt="grid", floatfmt=".4f",
+                                colalign=("left",) + ("right",) * (len(_BD_COLS) - 1)), ""]
 
 
-def breakdown(result, path, cfg=None):
+def breakdown(result, path, cfg=None, rets=None, basis="account"):
     ledger = result["ledger"]
     net = np.asarray(result["net"])
     base = float(net[0]) if net.size else 1000.0
     ppy = _periods_per_year(cfg) if cfg is not None else 252
-    m = metrics(net, periods_per_year=ppy)
+    m = metrics(net, periods_per_year=ppy, rets=rets, basis=basis)
     port = _trade_stats(ledger, base=base)
     if m:
         port["sharpe"] = m.get("sharpe", 0.0)
@@ -584,7 +638,8 @@ def breakdown(result, path, cfg=None):
     if len(ep_order) > 1:
         by_episode.append(("all", _trade_stats(ledger, base=base)))
 
-    by_side = _bucket(ledger, lambda t: t["side"], ["long", "short"])
+    by_side = _bucket(ledger, lambda t: "bull (long)" if t["side"] == "long" else "bear (short)",
+                      ["bull (long)", "bear (short)"])
     by_exit = _bucket(ledger, lambda t: t["exit_type"],
                       ["take_profit", "stop_loss", "market_close", "liquidation"])
     by_outcome = _bucket(ledger, lambda t: ("win" if (t.get("realized_pnl", 0) or 0) > 0 else
@@ -593,13 +648,40 @@ def breakdown(result, path, cfg=None):
 
     def _lev(t):
         v = float(t.get("leverage", 0) or 0)
-        return "0-2.5x" if v <= 2.5 else "2.5-5x" if v <= 5 else "5-7.5x" if v <= 7.5 else "7.5-10x" if v <= 10 else "10x+"
-    by_lev = _bucket(ledger, _lev, ["0-2.5x", "2.5-5x", "5-7.5x", "7.5-10x", "10x+"])
+        if v < 5:
+            return "cruiser (1-5x)"
+        if v < 10:
+            return "charger (5-10x)"
+        if v < 20:
+            return "turbo (10-20x)"
+        if v < 50:
+            return "warp (20-50x)"
+        if v < 100:
+            return "hyper (50-100x)"
+        return "singularity (100x+)"
+    by_lev = _bucket(ledger, _lev, ["cruiser (1-5x)", "charger (5-10x)", "turbo (10-20x)",
+                                    "warp (20-50x)", "hyper (50-100x)", "singularity (100x+)"])
+
+    low_tf = ((cfg.get("data") or {}).get("timeframes") or {}).get("low", "5m") if cfg is not None else "5m"
+    from data import _tf_minutes
+    bar_secs = float(_tf_minutes(low_tf)) * 60.0
 
     def _hold(t):
         d = int(t.get("closed_at", 0) or 0) - int(t.get("opened_at", 0) or 0)
-        return "flash (<2)" if d < 2 else "scalp (2-5)" if d < 5 else "sprint (5-15)" if d < 15 else "sit (15-60)" if d < 60 else "camp (60+)"
-    by_hold = _bucket(ledger, _hold, ["flash (<2)", "scalp (2-5)", "sprint (5-15)", "sit (15-60)", "camp (60+)"])
+        secs = d * bar_secs
+        if secs <= 0:
+            return "unmatched (0s)"
+        if secs < 30:
+            return "flash (<30s)"
+        if secs < 120:
+            return "scalp (30s-2m)"
+        if secs < 900:
+            return "sprint (2-15m)"
+        if secs < 3600:
+            return "sit (15-60m)"
+        return "camp (1h+)"
+    by_hold = _bucket(ledger, _hold, ["unmatched (0s)", "flash (<30s)", "scalp (30s-2m)",
+                                      "sprint (2-15m)", "sit (15-60m)", "camp (1h+)"])
 
     ret_basis = (dict(cfg.get("returns", {})) if cfg is not None else {}).get("basis", "account")
 
@@ -608,20 +690,98 @@ def breakdown(result, path, cfg=None):
             base = float(t.get("collateral", 0) or 0)
         else:
             base = float(t.get("equity_before", 0) or 0)
-        r = 100.0 * (float(t.get("realized_pnl", 0) or 0)) / max(abs(base), 1e-9)
-        return "multi-R (>=10%)" if r >= 10 else "single-R (1-10%)" if r >= 1 else "scratch (<1%)" if r >= 0 else "loss (<0%)"
-    by_roe = _bucket(ledger, _roe, ["scratch (<1%)", "single-R (1-10%)", "multi-R (>=10%)", "loss (<0%)"])
+        r = 10_000.0 * (float(t.get("realized_pnl", 0) or 0)) / max(abs(base), 1e-9)
+        if r < 0:
+            return "dip (<0 bps)"
+        if r < 10:
+            return "scratch (<10 bps)"
+        if r < 100:
+            return "single-R (10-100 bps)"
+        return "multi-R (>=100 bps)"
+    by_roe = _bucket(ledger, _roe, ["dip (<0 bps)", "scratch (<10 bps)",
+                                    "single-R (10-100 bps)", "multi-R (>=100 bps)"])
+
+    def _collateral(t):
+        v = float(t.get("collateral", 0) or 0)
+        if v < 50:
+            return "pocket (<$50)"
+        if v < 200:
+            return "small ($50-$200)"
+        if v < 1000:
+            return "standard ($200-$1k)"
+        return "loaded (>=$1k)"
+    by_collateral = _bucket(ledger, _collateral, ["pocket (<$50)", "small ($50-$200)",
+                                                  "standard ($200-$1k)", "loaded (>=$1k)"])
 
     def _notional(t):
         v = float(t.get("notional", 0) or 0)
-        return "toy (<1k)" if v < 1000 else "standard (1-10k)" if v < 10_000 else "size (10-50k)" if v < 50_000 else "whale (>=50k)"
-    by_notional = _bucket(ledger, _notional, ["toy (<1k)", "standard (1-10k)", "size (10-50k)", "whale (>=50k)"])
+        if v < 1000:
+            return "toy (<$1k)"
+        if v < 10_000:
+            return "standard ($1k-$10k)"
+        if v < 50_000:
+            return "size ($10k-$50k)"
+        return "whale (>=$50k)"
+    by_notional = _bucket(ledger, _notional, ["toy (<$1k)", "standard ($1k-$10k)",
+                                              "size ($10k-$50k)", "whale (>=$50k)"])
+
+    def _heat(t):
+        eq = float(t.get("equity_before", base) or base)
+        r = eq / max(base, 1e-9)
+        if r < 0.80:
+            return "underwater (<80% eq)"
+        if r < 0.95:
+            return "bruised (80-95% eq)"
+        if r < 1.05:
+            return "par (95-105% eq)"
+        if r < 1.30:
+            return "green (105-130% eq)"
+        return "moon (>=130% eq)"
+    by_heat = _bucket(ledger, _heat, ["underwater (<80% eq)", "bruised (80-95% eq)", "par (95-105% eq)",
+                                      "green (105-130% eq)", "moon (>=130% eq)"])
+
+    def _bite(t):
+        coll = max(abs(float(t.get("collateral", 0) or 0)), 1e-9)
+        pct = 100.0 * abs(float(t.get("realized_pnl", 0) or 0)) / coll
+        if pct < 0.5:
+            return "dust (<0.5% margin)"
+        if pct < 2:
+            return "scratch (0.5-2%)"
+        if pct < 8:
+            return "nibble (2-8%)"
+        if pct < 20:
+            return "bite (8-20%)"
+        return "feast (>=20%)"
+    by_bite = _bucket(ledger, _bite, ["dust (<0.5% margin)", "scratch (0.5-2%)", "nibble (2-8%)",
+                                      "bite (8-20%)", "feast (>=20%)"])
+
+    def _liq(t):
+        lev = max(abs(float(t.get("leverage", 0) or 0)), 1e-9)
+        mmr = float((cfg.get("env") or {}).get("maintenance_margin_rate", 0.005)) if cfg is not None else 0.005
+        dist = 100.0 * (1.0 - mmr) / lev
+        if dist < 2:
+            return "knife-edge (<2%)"
+        if dist < 5:
+            return "tight (2-5%)"
+        if dist < 15:
+            return "cushion (5-15%)"
+        return "fortress (>=15%)"
+    by_liq = _bucket(ledger, _liq, ["knife-edge (<2%)", "tight (2-5%)",
+                                    "cushion (5-15%)", "fortress (>=15%)"])
 
     def _fee_drag(t):
         notional = max(abs(float(t.get("notional", 0) or 0)), 1e-9)
         bps = 10_000.0 * float(t.get("fee", 0) or 0) / notional
-        return "free (maker)" if bps <= 0 else "light (<5 bps)" if bps < 5 else "heavy (>=5 bps)"
+        if bps <= 0:
+            return "free (maker)"
+        if bps < 5:
+            return "light (<5 bps)"
+        return "heavy (>=5 bps)"
     by_fee = _bucket(ledger, _fee_drag, ["free (maker)", "light (<5 bps)", "heavy (>=5 bps)"])
+
+    margin_mode = ((cfg.get("env") or {}).get("margin_mode", "isolated")) if cfg is not None else "isolated"
+    by_margin = _bucket(ledger, lambda t: ("pool (cross)" if margin_mode == "cross" else "loner (isolated)"),
+                        ["loner (isolated)", "pool (cross)"])
 
     def _vintage(t):
         i = ledger.index(t)
@@ -641,14 +801,19 @@ def breakdown(result, path, cfg=None):
     for title, groups in [
         ("By symbol", sym_groups),
         ("By episode", by_episode),
-        ("By side", by_side),
+        ("By position direction", by_side),
         ("By exit", by_exit),
         ("By outcome", by_outcome),
         ("By leverage", by_lev),
         ("By hold duration", by_hold),
         ("By return" if ret_basis == "collateral" else "By RoE", by_roe),
+        ("By collateral", by_collateral),
         ("By notional", by_notional),
+        ("By equity heat", by_heat),
+        ("By bite size", by_bite),
+        ("By liquidation distance", by_liq),
         ("By fee drag", by_fee),
+        ("By margin type", by_margin),
         ("By trade vintage", by_vintage),
     ]:
         lines += _bd_table(title, groups, port)
@@ -670,16 +835,63 @@ def _rgba(hex_color: str, alpha: float) -> str:
     return f"rgba({r},{g},{b},{alpha})"
 
 
+# Local theme palettes (repo-tracked). Keys mirror dirty-mkt-data's Theme
+# dataclass so they slot straight into the shared _palette() mapping.
+_LOCAL_THEMES = {
+    "cyberpunk": dict(
+        background="#0b0b16", plot_background="#121222", grid="#1f1f38",
+        text="#e0e0e8", up="#00f3ff", down="#ff0055", accent="#00ff66",
+    ),
+    "nordic_frost": dict(
+        background="#f4f7f6", plot_background="#ffffff", grid="#e2e8e6",
+        text="#2e4057", up="#048a81", down="#858ae3", accent="#ff8a5b",
+    ),
+    "tokyo_midnight": dict(
+        background="#1a1b26", plot_background="#24283b", grid="#414868",
+        text="#c0caf5", up="#7aa2f7", down="#f7768e", accent="#bb9af7",
+    ),
+    "wes_anderson": dict(
+        background="#fbf9f1", plot_background="#f4efe2", grid="#e6decb",
+        text="#33261d", up="#66a182", down="#d1495b", accent="#edae49",
+    ),
+    "brutalist_terminal": dict(
+        background="#000000", plot_background="#000000", grid="#1a1a1a",
+        text="#00ff00", up="#00ff00", down="#ff3333", accent="#00ffff",
+    ),
+    "botanical_dark": dict(
+        background="#111b15", plot_background="#18261e", grid="#23372c",
+        text="#d8e2dc", up="#4e8752", down="#b48a60", accent="#a3c1ad",
+    ),
+    "solarized_warm": dict(
+        background="#fdf6e3", plot_background="#eee8d5", grid="#e0dcc7",
+        text="#657b83", up="#2aa198", down="#cb4b16", accent="#268bd2",
+    ),
+    "sunset_drive": dict(
+        background="#15121f", plot_background="#1f1a2e", grid="#2e2542",
+        text="#f0e6ff", up="#ff9966", down="#c71585", accent="#ff5e7e",
+    ),
+}
+
+
 def _palette(theme: str) -> dict:
-    """Map a dirty-mkt-data theme (synthwave / ghibli / valorant) onto the
-    iso-trading-bot ``_C`` palette roles (up=positive, down=negative, accent=highlight).
+    """Map a theme onto the iso-trading-bot ``_C`` palette roles
+    (up=positive, down=negative, accent=highlight).
+
+    Local repo themes (see ``_LOCAL_THEMES``: cyberpunk, nordic_frost,
+    tokyo_midnight, wes_anderson, brutalist_terminal, botanical_dark,
+    solarized_warm, sunset_drive) win; anything else falls through to the
+    dirty-mkt-data package themes (synthwave / ghibli / valorant).
 
     ``muted`` (tick labels / subtitles) is derived from the background's
     brightness so it always has readable contrast on light *and* dark themes.
     """
-    from dirty_mkt_data.viz.themes import THEMES
+    from dirty_mkt_data.viz.themes import Theme, THEMES
 
-    t = THEMES[theme]
+    local = _LOCAL_THEMES.get(theme)
+    if local is not None:
+        t = Theme(name=theme, **local)
+    else:
+        t = THEMES[theme]
     up, down, accent = t.up, t.down, t.accent
     r, g, b = (int(t.background[i : i + 2], 16) for i in (1, 3, 5))
     dark_bg = (r + g + b) / 3.0 < 128.0
@@ -1056,13 +1268,26 @@ def _aggregate_episodes(episodes):
     if agg_per_symbol is not None:
         agg_per_symbol = agg_per_symbol / seen
 
-    roc_eps = [np.asarray(e["roc"]) for e in episodes if e.get("roc") is not None]
+    roc_eps = [e for e in episodes
+               if e.get("roc_realized") is not None and e.get("roc_coll") is not None]
     if len(roc_eps) == len(episodes) and roc_eps:
-        roc = np.mean(np.stack([_nonempty(v) for v in roc_eps]), axis=0)
-    elif roc_eps:
-        roc = roc_eps[0]
+        T = len(episodes[0]["roc_realized"])
+        tot_real = np.zeros(T, dtype=float)
+        tot_coll = np.zeros(T, dtype=float)
+        for e in roc_eps:
+            r = np.asarray(e["roc_realized"]).reshape(-1)[:T]
+            c = np.asarray(e["roc_coll"]).reshape(-1)[:T]
+            tot_real += r
+            tot_coll += c
+        roc = np.where(tot_coll > 1e-6, tot_real / np.maximum(tot_coll, 1e-9), 0.0)
     else:
-        roc = np.zeros(1)
+        roc_eps_fallback = [np.asarray(e["roc"]) for e in episodes if e.get("roc") is not None]
+        if len(roc_eps_fallback) == len(episodes) and roc_eps_fallback:
+            roc = np.mean(np.stack([_nonempty(v) for v in roc_eps_fallback]), axis=0)
+        elif roc_eps_fallback:
+            roc = roc_eps_fallback[0]
+        else:
+            roc = np.zeros(1)
 
     return {
         "ledger": ledger,
@@ -1108,7 +1333,7 @@ def generate_report(cfg, manager, worker, out_dir, norm_state=None):
     if ret_basis == "collateral" and np.asarray(result.get("roc")).size > 1:
         rets = np.asarray(result["roc"])[1:]
     write_ledger(result["ledger"], out_dir / "trades.csv")
-    breakdown(result, out_dir / "breakdown.txt", cfg)
+    breakdown(result, out_dir / "breakdown.txt", cfg, rets=rets, basis=ret_basis)
     figure1(result, out_dir / "figure1.png", theme=theme, overlays=overlays, ret_series=rets)
     figure2(result, out_dir / "figure2.png", theme=theme)
     for raw in episodes:

@@ -21,6 +21,8 @@ env:
   max_collateral: 10000.0
   risk_min: 0.01
   risk_max: 0.05
+  use_take_profit: true
+  use_stop_loss: true
   take_profit: 0.01
   stop_loss: 0.008
   enforce_goal: false
@@ -43,7 +45,7 @@ norm:
   gamma: 0.99
 
 report:
-  theme: synthwave
+  theme: sunset_drive
   overlays: false
 
 returns:

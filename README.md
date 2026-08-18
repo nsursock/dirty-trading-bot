@@ -34,6 +34,10 @@ one symbol with at most one open position (`flat / long / short`) on isolated
 margin, with:
 
 - taker fees, entry slippage, funding accrual
+- take-profit / stop-loss intrabar exits, each independently switchable via
+  `env.use_take_profit` / `env.use_stop_loss` (both default `true`); turns
+  either off to let the policy hold through the band — liquidations are
+  always active and cannot be disabled
 - maintenance-margin liquidation + liquidation penalty
 - bankruptcy truncation at `balance < min_collateral` (10 USDC)
 - causal fills — act on bar `t`, fill at bar `t+1`
@@ -212,6 +216,24 @@ worker:  { buffer_size, learning_starts, net_arch, ... }  # SAC
 ```
 
 `normal.yaml` runs `8 symbols × 64 worlds = 512 parallel environments`.
+
+### Report themes
+
+`report.theme` picks the figure palette. `synthwave` / `ghibli` /
+`valorant` come from the `dirty-mkt-data` package; this repo ships its own
+set that wins over any package theme of the same name:
+
+- `cyberpunk` — neon-grid dark (cyan / hot pink / electric purple)
+- `nordic_frost` — light, minimalist Scandinavian fintech
+- `tokyo_midnight` — deep indigo + soft blues/lavender
+- `wes_anderson` — warm vintage pastels on cream
+- `brutalist_terminal` — pure black + terminal green/red accents
+- `botanical_dark` — dark forest greens with bronze/clay
+- `solarized_warm` — editorial cream with earth tones
+- `sunset_drive` — amber/coral/magenta twilight gradient
+
+Palettes are defined in `scripts/report.py` (`_LOCAL_THEMES`) and map to the
+figure roles via `_palette()` regardless of light/dark background.
 
 ## Project layout
 

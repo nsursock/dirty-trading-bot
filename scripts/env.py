@@ -54,6 +54,8 @@ class TradingEnv:
         risk_max: float = 0.05,
         take_profit: float = 0.0,
         stop_loss: float = 0.0,
+        use_take_profit: bool = True,
+        use_stop_loss: bool = True,
         initial_balance: float = 1000.0,
         size_fraction: float = 1.0,
         side_threshold: float = 0.2,
@@ -101,6 +103,8 @@ class TradingEnv:
         self.risk_max = float(risk_max)
         self.take_profit = float(take_profit)
         self.stop_loss = float(stop_loss)
+        self.use_take_profit = bool(use_take_profit)
+        self.use_stop_loss = bool(use_stop_loss)
         self.initial_balance = float(initial_balance)
         self.size_fraction = float(size_fraction)
         self.side_threshold = float(side_threshold)
@@ -265,17 +269,23 @@ class TradingEnv:
             tp_hit = mx.zeros((num_envs,), dtype=mx.bool_)
             sl_hit = mx.zeros((num_envs,), dtype=mx.bool_)
             exit_hit = mx.zeros((num_envs,), dtype=mx.bool_)
-            if take_profit > 0.0 or stop_loss > 0.0:
+            sl_enabled = self.use_stop_loss and stop_loss > 0.0
+            tp_enabled = self.use_take_profit and take_profit > 0.0
+            if sl_enabled or tp_enabled:
                 long = q > EPS
                 short = q < -EPS
                 sl_px = mx.where(long, entry * (1.0 - stop_loss), entry * (1.0 + stop_loss))
                 tp_px = mx.where(long, entry * (1.0 + take_profit), entry * (1.0 - take_profit))
-                sl_touch = (long & (low <= entry * (1.0 - stop_loss))) | (
-                    short & (high >= entry * (1.0 + stop_loss))
-                )
-                tp_touch = (long & (high >= entry * (1.0 + take_profit))) | (
-                    short & (low <= entry * (1.0 - take_profit))
-                )
+                sl_touch = mx.zeros((num_envs,), dtype=mx.bool_)
+                tp_touch = mx.zeros((num_envs,), dtype=mx.bool_)
+                if sl_enabled:
+                    sl_touch = (long & (low <= entry * (1.0 - stop_loss))) | (
+                        short & (high >= entry * (1.0 + stop_loss))
+                    )
+                if tp_enabled:
+                    tp_touch = (long & (high >= entry * (1.0 + take_profit))) | (
+                        short & (low <= entry * (1.0 - take_profit))
+                    )
                 sl_hit = sl_touch
                 tp_hit = tp_touch & ~sl_touch
                 exit_hit = sl_touch | tp_touch
