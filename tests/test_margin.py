@@ -23,7 +23,8 @@ def _env(mode, seed=5):
         b.features, b.ohlcv.closes, highs=b.ohlcv.highs, lows=b.ohlcv.lows,
         n_envs_per_symbol=1, action_space="continuous", goal_dim=0,
         lev_min=2.0, lev_max=20.0, risk_min=0.05, risk_max=0.05,
-        take_profit=0.0, stop_loss=0.0, trade_knob=1.0, fee_rate=5e-4,
+        take_profit=0.0, stop_loss=0.0, trade_knob=1.0, open_fee_rate=0.0,
+        close_fee_rate=0.0, holding_fee_daily=0.0,
         margin_mode=mode, seed=seed,
     )
 
@@ -90,7 +91,8 @@ def test_collateral_reward_basis_runs_finite(mode):
         b.features, b.ohlcv.closes, highs=b.ohlcv.highs, lows=b.ohlcv.lows,
         n_envs_per_symbol=1, action_space="continuous", goal_dim=0,
         lev_min=2.0, lev_max=20.0, risk_min=0.05, risk_max=0.05,
-        take_profit=0.0, stop_loss=0.0, trade_knob=1.0, fee_rate=5e-4,
+        take_profit=0.0, stop_loss=0.0, trade_knob=1.0, open_fee_rate=0.0,
+        close_fee_rate=0.0, holding_fee_daily=0.0,
         margin_mode=mode, return_basis="collateral", seed=5,
     )
     env.reset()

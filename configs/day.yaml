@@ -12,11 +12,18 @@ env:
   n_envs_per_symbol: 2048
   lev_min: 2.0
   lev_max: 20.0
-  fee_rate: 0.0005
+  open_fee_rate: 0.0003
+  close_fee_rate: 0.0006
   slippage_bps: 1.0
-  funding_rate: 0.0001
-  maintenance_margin_rate: 0.005
-  liquidation_fee_rate: 0.01
+  holding_fee_daily: 0.00015
+  bars_per_day: 96
+  liquidation_fee_rate: 0.003
+  liq_threshold_base: 0.90
+  liq_threshold_floor: 0.67
+  liq_threshold_ref_lev: 2.0
+  liq_threshold_hi_lev: 150.0
+  liq_threshold_lo_lev: 1.0
+  liq_mark_impact: 0.005
   min_collateral: 10.0
   max_collateral: 10000.0
   risk_min: 0.01
@@ -45,7 +52,7 @@ norm:
   gamma: 0.99
 
 report:
-  theme: sunset_drive
+  theme: ghibli
   overlays: false
 
 returns:

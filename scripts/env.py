@@ -1,8 +1,9 @@
 """Vectorized per-symbol perpetuals trading environment (pure MLX, fused step).
 
 Each environment instance trades one symbol with at most one open position
-(flat / long / short) on isolated or cross margin, with taker fees, entry
-slippage, funding accrual, liquidation and bankruptcy truncation. The ``step``
+(flat / long / short) on isolated or cross margin, with platform-agnostic
+taker fees (open 3 bps / close 6 bps), entry slippage, a daily holding-fee
+buffer, and a dynamic collateral-retention liquidation threshold. The ``step``
 is a single ``mx.compile``-fused kernel with no Python loops; the state/time/RNG
 threading matches ``dirty_mlx_ml.reinforcement`` so PPO and SAC consume it
 directly (SB3-like ``reset`` / ``step`` plus the internal ``_step_fn``
@@ -43,11 +44,18 @@ class TradingEnv:
         n_envs_per_symbol: int = 8,
         lev_min: float = 2.0,
         lev_max: float = 20.0,
-        fee_rate: float = 5e-4,
+        open_fee_rate: float = 3e-4,
+        close_fee_rate: float = 6e-4,
         slippage_bps: float = 1.0,
-        funding_rate: float = 1e-4,
-        maintenance_margin_rate: float = 5e-3,
-        liquidation_fee_rate: float = 1e-2,
+        holding_fee_daily: float = 1.5e-4,
+        bars_per_day: int = 288,
+        liquidation_fee_rate: float = 3e-3,
+        liq_threshold_base: float = 0.90,
+        liq_threshold_floor: float = 0.67,
+        liq_threshold_ref_lev: float = 2.0,
+        liq_threshold_hi_lev: float = 150.0,
+        liq_threshold_lo_lev: float = 1.0,
+        liq_mark_impact: float = 0.005,
         min_collateral: float = 10.0,
         max_collateral: float = 10_000.0,
         risk_min: float = 0.01,
@@ -92,11 +100,18 @@ class TradingEnv:
         self.goal_dim = int(goal_dim)
         self.lev_min = float(lev_min)
         self.lev_max = float(lev_max)
-        self.fee_rate = float(fee_rate)
+        self.open_fee_rate = float(open_fee_rate)
+        self.close_fee_rate = float(close_fee_rate)
         self.slip = float(slippage_bps) / 1e4
-        self.funding_rate = float(funding_rate)
-        self.maintenance_margin_rate = float(maintenance_margin_rate)
+        self.holding_fee_daily = float(holding_fee_daily)
+        self.bars_per_day = int(bars_per_day)
         self.liquidation_fee_rate = float(liquidation_fee_rate)
+        self.liq_threshold_base = float(liq_threshold_base)
+        self.liq_threshold_floor = float(liq_threshold_floor)
+        self.liq_threshold_ref_lev = float(liq_threshold_ref_lev)
+        self.liq_threshold_hi_lev = float(liq_threshold_hi_lev)
+        self.liq_threshold_lo_lev = float(liq_threshold_lo_lev)
+        self.liq_mark_impact = float(liq_mark_impact)
         self.min_collateral = float(min_collateral)
         self.max_collateral = float(max_collateral)
         self.risk_min = float(risk_min)
@@ -210,11 +225,20 @@ class TradingEnv:
         discrete = self.discrete
         lev_min = self.lev_min
         lev_max = self.lev_max
-        fee_rate = self.fee_rate
+        open_fee = self.open_fee_rate
+        close_fee = self.close_fee_rate
         slip = self.slip
-        funding = self.funding_rate
-        maint = self.maintenance_margin_rate
+        funding = self.holding_fee_daily / max(int(self.bars_per_day), 1)
         liq_fee = self.liquidation_fee_rate
+        thr_base = self.liq_threshold_base
+        thr_floor = self.liq_threshold_floor
+        thr_ref = self.liq_threshold_ref_lev
+        thr_hi = self.liq_threshold_hi_lev
+        thr_lo = self.liq_threshold_lo_lev
+        # Fixed loss-fraction curve (independent of lev_max): 100% at thr_lo,
+        # thr_base at thr_ref, thr_floor at thr_hi. Two linear segments.
+        thr_slope_lo = (thr_base - 1.0) / max(thr_ref - thr_lo, 1e-6)
+        thr_slope_hi = (thr_floor - thr_base) / max(thr_hi - thr_ref, 1e-6)
         min_col = self.min_collateral
         max_coll = self.max_collateral
         risk_min = self.risk_min
@@ -293,31 +317,46 @@ class TradingEnv:
                 if self.margin_mode == "cross":
                     balance = mx.where(
                         exit_hit,
-                        balance + q * (fill_exit - entry) - fee_rate * mx.abs(q) * fill_exit,
+                        balance + q * (fill_exit - entry) - close_fee * mx.abs(q) * fill_exit,
                         balance,
                     )
                 else:
                     balance = mx.where(
                         exit_hit,
-                        balance + collateral + q * (fill_exit - entry) - fee_rate * mx.abs(q) * fill_exit,
+                        balance + collateral + q * (fill_exit - entry) - close_fee * mx.abs(q) * fill_exit,
                         balance,
                     )
                 q = mx.where(exit_hit, 0.0, q)
                 entry = mx.where(exit_hit, 0.0, entry)
                 collateral = mx.where(exit_hit, 0.0, collateral)
 
+            # Dynamic liquidation threshold (isolated margin): liquidate once
+            # the position has lost ``thr`` of its collateral (the PERP loss,
+            # not the underlying move). Fixed curve, independent of lev_max:
+            # 100% at 1x -> 90% at 2x -> 67% at 150x (then floored).
+            lev_open = mx.abs(q) * entry / (collateral + EPS)
+            thr = mx.where(
+                lev_open <= thr_ref,
+                1.0 + thr_slope_lo * (lev_open - thr_lo),
+                thr_base + thr_slope_hi * (lev_open - thr_ref),
+            )
+            thr = mx.clip(thr, thr_floor, 1.0)
             if self.margin_mode == "cross":
-                liq = (mx.abs(q) > EPS) & ((balance + q * (price - entry)) <= maint * notional)
+                liq = (mx.abs(q) > EPS) & ((balance + q * (price - entry)) <= (1.0 - thr) * collateral)
                 balance = mx.where(
                     liq,
-                    mx.maximum(balance + q * (price - entry) - liq_fee * notional, 0.0),
+                    mx.maximum(balance - collateral - liq_fee * notional, 0.0),
                     balance,
                 )
             else:
-                liq = (mx.abs(q) > EPS) & ((collateral + q * (price - entry)) <= maint * notional)
+                liq = (mx.abs(q) > EPS) & ((collateral + q * (price - entry)) <= (1.0 - thr) * collateral)
+                # Full collateral loss on liquidation: the locked margin is
+                # forfeited (never returned to cash). The liquidation fee is
+                # charged on top of the forfeit, floored at zero so isolated
+                # bankruptcy truncation keeps the account non-negative.
                 balance = mx.where(
                     liq,
-                    balance + mx.maximum(collateral + q * (price - entry) - liq_fee * notional, 0.0),
+                    mx.maximum(balance - liq_fee * notional, 0.0),
                     balance,
                 )
             q = mx.where(liq, 0.0, q)
@@ -348,13 +387,13 @@ class TradingEnv:
             if self.margin_mode == "cross":
                 balance = mx.where(
                     close,
-                    balance + q * (price - entry) - fee_rate * mx.abs(q) * price,
+                    balance + q * (price - entry) - close_fee * mx.abs(q) * price,
                     balance,
                 )
             else:
                 balance = mx.where(
                     close,
-                    balance + collateral + q * (price - entry) - fee_rate * mx.abs(q) * price,
+                    balance + collateral + q * (price - entry) - close_fee * mx.abs(q) * price,
                     balance,
                 )
             q = mx.where(close, 0.0, q)
@@ -371,7 +410,7 @@ class TradingEnv:
                 size_base = balance
             collateral_new = mx.clip(risk_frac * size_base, min_col, max_coll)
             notional_new = collateral_new * lev_used
-            fee_open = fee_rate * notional_new
+            fee_open = open_fee * notional_new
             fill = price * (1.0 + side * slip)
             if self.margin_mode == "cross":
                 # Margin is not locked: the account pays only the entry fee,

@@ -33,12 +33,17 @@ A vectorized, per-symbol perpetuals simulator. Each environment instance trades
 one symbol with at most one open position (`flat / long / short`) on isolated
 margin, with:
 
-- taker fees, entry slippage, funding accrual
+- platform-agnostic taker fees (open 3 bps / close 6 bps) + entry slippage
+- holding-fee buffer (`holding_fee_daily`, ~1.5 bps/day) accrued per bar
 - take-profit / stop-loss intrabar exits, each independently switchable via
   `env.use_take_profit` / `env.use_stop_loss` (both default `true`); turns
   either off to let the policy hold through the band — liquidations are
   always active and cannot be disabled
-- maintenance-margin liquidation + liquidation penalty
+- dynamic liquidation threshold keyed on the perp's own loss (not the
+  underlying move), a fixed curve independent of `lev_max`: 100% at 1x,
+  90% at 2x, 67% at 150x (then floored); full collateral loss on
+  liquidation plus a 30 bps liquidation fee and a capped 0.5% adverse mark
+  price on the forced fill
 - bankruptcy truncation at `balance < min_collateral` (10 USDC)
 - causal fills — act on bar `t`, fill at bar `t+1`
 - discrete (`Flat/Long/Short`) or continuous (`[-1, 1]` → discretized) action
@@ -206,7 +211,7 @@ scale.
 
 ```yaml
 data:    { n_symbols, n_steps, dt_days }
-env:     { n_envs_per_symbol, leverage, margin_mode, fee_rate, funding_rate, ... }
+env:     { n_envs_per_symbol, leverage, margin_mode, open_fee_rate, close_fee_rate, ... }
 reward:  { mode: smoke|normal, drawdown_penalty }
 returns: { basis: account|collateral }
 train:   { total_timesteps, log_interval }

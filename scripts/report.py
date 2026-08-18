@@ -126,8 +126,11 @@ def run_test(cfg, manager, worker, norm_state=None, seed_offset=1) -> dict:
     sym_off_hi = mx.array([s * T_hi for s in sym_idx], dtype=mx.int32)
     high_feats = build_high_view(bundle.high_features)
     side_thr = e.get("side_threshold", 0.2)
-    fee_rate = e.get("fee_rate", 5e-4)
-    funding = e.get("funding_rate", 1e-4)
+    open_fee_rate = e.get("open_fee_rate", 3e-4)
+    close_fee_rate = e.get("close_fee_rate", 6e-4)
+    liq_fee_rate = e.get("liquidation_fee_rate", 3e-3)
+    mark_impact = e.get("liq_mark_impact", 0.005)
+    funding = e.get("holding_fee_daily", 1.5e-4) / max(int(e.get("bars_per_day", 288)), 1)
     T = env.T
 
     worker_obs = env.reset()[0]
@@ -196,7 +199,7 @@ def run_test(cfg, manager, worker, norm_state=None, seed_offset=1) -> dict:
                         "leverage": float(notional[i] / (collateral[i] + 1e-9)),
                         "collateral": float(collateral[i]),
                         "equity_before": float(equity[i]),
-                        "fee": fee_rate * notional[i],
+                        "fee": open_fee_rate * notional[i],
                         "funding": 0.0,
                         "exit_type": "open",
                     }
@@ -209,12 +212,15 @@ def run_test(cfg, manager, worker, norm_state=None, seed_offset=1) -> dict:
                     if tr is not None:
                         if exit_type == "liquidation":
                             # Isolated margin: liquidation loses the full
-                            # collateral, no more (pnl % capped at -100%).
-                            # Funding/fees stay on their own cost columns.
+                            # collateral (pnl % capped at -100%) plus the
+                            # liquidation fee. Fill happens at the mark price
+                            # with the capped adverse impact.
+                            mark = exit_price * (1.0 - mark_impact * (1.0 if tr["side"] == "long" else -1.0))
                             realized = -float(tr["collateral"])
-                            exit_fee = 0.0
+                            exit_fee = liq_fee_rate * abs(tr["qty"]) * mark
+                            exit_price = mark
                         else:
-                            exit_fee = fee_rate * abs(tr["qty"]) * exit_price
+                            exit_fee = close_fee_rate * abs(tr["qty"]) * exit_price
                             realized = (tr["qty"] * (exit_price - tr["entry_price"])
                                         - tr["fee"] - exit_fee - tr["funding"])
                         ledger.append(_finish_trade(tr, exit_price, t, exit_type, exit_fee, realized))
@@ -229,10 +235,10 @@ def run_test(cfg, manager, worker, norm_state=None, seed_offset=1) -> dict:
                     if tr is not None:
                         realized = (tr["qty"] * (exit_price - tr["entry_price"])
                                     - tr["fee"]
-                                    - fee_rate * abs(tr["qty"]) * exit_price
+                                    - close_fee_rate * abs(tr["qty"]) * exit_price
                                     - tr["funding"])
                         ledger.append(_finish_trade(tr, exit_price, t, "market_close",
-                                                    fee_rate * abs(tr["qty"]) * exit_price, realized))
+                                                    close_fee_rate * abs(tr["qty"]) * exit_price, realized))
                         exits.append("market_close")
                         book[i] += realized
                         fees_paid[i] += tr["fee"]
@@ -248,7 +254,7 @@ def run_test(cfg, manager, worker, norm_state=None, seed_offset=1) -> dict:
                         "notional": float(notional[i]),
                         "leverage": float(notional[i] / (collateral[i] + 1e-9)),
                         "equity_before": float(equity[i]),
-                        "fee": fee_rate * notional[i],
+                        "fee": open_fee_rate * notional[i],
                         "funding": 0.0,
                         "exit_type": "open",
                     }
@@ -296,7 +302,10 @@ def run_test(cfg, manager, worker, norm_state=None, seed_offset=1) -> dict:
     roc_coll = np.zeros(T_bars, dtype=float)
     sym_real = np.zeros((S, T_bars), dtype=float)
     for tr in ledger:
-        ca = int(tr["closed_at"])
+        # step_axis[j] = j+1 (t is 1-indexed, j is 0-indexed): a trade closing
+        # at bar t maps to index t-1, so a close on the final bar (t=T-1) stays
+        # in bounds.
+        ca = int(tr["closed_at"]) - 1
         realized = float(tr.get("realized_pnl", 0.0) or 0.0)
         coll = float(tr.get("collateral", 0.0) or 0.0)
         roc_realized[ca] += realized
@@ -544,7 +553,7 @@ def _config_lines(cfg) -> list[str]:
         f"symbols: {d.get('n_symbols')}  steps: {d.get('n_steps')}  dt_days: {d.get('dt_days')}",
         f"env: {n_sym} symbols x {per_sym} = {n_sym * per_sym} test envs  "
         f"lev {e.get('lev_min')}–{e.get('lev_max')}x  risk {float(e.get('risk_min',0))*100:.0f}–{float(e.get('risk_max',0))*100:.0f}%  "
-        f"eq={e.get('initial_balance')}  fee={e.get('fee_rate')}  funding={e.get('funding_rate')}",
+        f"eq={e.get('initial_balance')}  fees o/c={e.get('open_fee_rate')}/{e.get('close_fee_rate')}  liq={e.get('liquidation_fee_rate')}  hold/day={e.get('holding_fee_daily')}",
         f"reward: {r.get('mode')}  dd_pen={r.get('drawdown_penalty')}  clip={r.get('reward_clip')}  trade_knob={e.get('trade_knob')}",
         f"hrl: goal_every={h.get('goal_every')}  goal_dim={h.get('goal_dim')}  "
         f"manager n_steps={cfg.get('manager',{}).get('n_steps')}  worker net={w.get('net_arch')} lr={w.get('learning_rate')}",
@@ -757,8 +766,19 @@ def breakdown(result, path, cfg=None, rets=None, basis="account"):
 
     def _liq(t):
         lev = max(abs(float(t.get("leverage", 0) or 0)), 1e-9)
-        mmr = float((cfg.get("env") or {}).get("maintenance_margin_rate", 0.005)) if cfg is not None else 0.005
-        dist = 100.0 * (1.0 - mmr) / lev
+        e = (cfg.get("env") or {}) if cfg is not None else {}
+        base = float(e.get("liq_threshold_base", 0.90))
+        floor = float(e.get("liq_threshold_floor", 0.67))
+        ref = float(e.get("liq_threshold_ref_lev", 2.0))
+        hi = float(e.get("liq_threshold_hi_lev", 150.0))
+        lo = float(e.get("liq_threshold_lo_lev", 1.0))
+        slope_lo = (base - 1.0) / max(ref - lo, 1e-6)
+        slope_hi = (floor - base) / max(hi - ref, 1e-6)
+        thr = (1.0 + slope_lo * (lev - lo)) if lev <= ref else (base + slope_hi * (lev - ref))
+        thr = min(1.0, max(floor, thr))
+        # ``thr`` is the perp loss fraction at which liquidation fires, so the
+        # required adverse underlying move is ``thr / leverage``.
+        dist = 100.0 * thr / lev
         if dist < 2:
             return "knife-edge (<2%)"
         if dist < 5:

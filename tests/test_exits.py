@@ -24,7 +24,8 @@ def _make_env(**over):
     kw = dict(
         n_envs_per_symbol=1, action_space="continuous", goal_dim=0,
         lev_min=2.0, lev_max=20.0, risk_min=0.05, risk_max=0.05,
-        take_profit=0.05, stop_loss=0.05, trade_knob=1.0, fee_rate=0.0,
+        take_profit=0.05, stop_loss=0.05, trade_knob=1.0,
+        open_fee_rate=0.0, close_fee_rate=0.0, holding_fee_daily=0.0,
         margin_mode="isolated", seed=1,
     )
     kw.update(over)
@@ -80,7 +81,8 @@ def test_liquidation_never_disabled():
         lev_min=150.0, lev_max=150.0, risk_min=0.1, risk_max=0.1,
         take_profit=0.05, stop_loss=0.05,
         use_take_profit=False, use_stop_loss=False,
-        trade_knob=1.0, fee_rate=0.0, margin_mode="isolated", seed=1,
+        trade_knob=1.0, open_fee_rate=0.0, close_fee_rate=0.0,
+        holding_fee_daily=0.0, margin_mode="isolated", seed=1,
     )
     env.reset()
     exits = []
