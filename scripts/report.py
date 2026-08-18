@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import csv
 import logging
-import os
+import math
 from collections import Counter
 from pathlib import Path
 
@@ -21,10 +21,16 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from tabulate import tabulate
 
-from data import SYMBOLS, generate
+from data import SYMBOLS, TRADING_DAYS, build_high_view, generate, mgr_obs
 from env import TradingEnv
 
 log = logging.getLogger("trading")
+
+# The locked final-test seed offsets. Optuna / hyperparameter search must
+# NEVER read these; ``validate`` uses the validation bundle instead.
+TEST_SEED_OFFSETS = (1,)
+# Held-out validation bundle for hyperparameter search (mean +/- CI).
+VALID_SEED_OFFSETS = (2, 3, 4, 5)
 
 
 def _np(x) -> np.ndarray:
@@ -81,18 +87,20 @@ def _finish_trade(tr, exit_price, exit_step, exit_type, fee, realized):
 def _mgr_obs_test(high_feats, sym_off_hi, worker_obs, low_steps, T_hi, F, n_resample):
     import mlx.core as mx
 
-    high_idx = mx.minimum(low_steps // n_resample, T_hi - 1)
-    feats = mx.take(high_feats, sym_off_hi + high_idx, axis=0)
     acct = worker_obs[:, F : F + 6]
-    return mx.concatenate([feats, acct], axis=1)
+    return mgr_obs(high_feats, acct, low_steps, sym_off_hi, T_hi, n_resample)
 
 
-def run_test(cfg, manager, worker, norm_state=None) -> dict:
-    """Deterministic joint rollout -> ledger + per-step series."""
+def run_test(cfg, manager, worker, norm_state=None, seed_offset=1) -> dict:
+    """Deterministic joint rollout -> ledger + per-step series.
+
+    ``seed_offset`` selects the GBM bundle draw: the locked final test uses
+    ``TEST_SEED_OFFSETS``; validation uses ``VALID_SEED_OFFSETS``.
+    """
     import mlx.core as mx
     from dirty_mlx_ml.reinforcement import VecNormalize
 
-    bundle, env, symbols, e = _test_env(cfg)
+    bundle, env, symbols, e = _test_env(cfg, seed_offset=seed_offset)
     if norm_state is not None:
         env = VecNormalize(env, norm_obs=True, norm_reward=True,
                            clip_obs=10.0, clip_reward=10.0, gamma=0.99)
@@ -109,7 +117,7 @@ def run_test(cfg, manager, worker, norm_state=None) -> dict:
     T_hi = bundle.high_features.shape[1]
     sym_idx = [s for s in range(S) for _ in range(env.n_envs_per_symbol)]
     sym_off_hi = mx.array([s * T_hi for s in sym_idx], dtype=mx.int32)
-    high_feats = mx.reshape(bundle.high_features, (S * T_hi, bundle.high_features.shape[2]))
+    high_feats = build_high_view(bundle.high_features)
     side_thr = e.get("side_threshold", 0.2)
     fee_rate = e.get("fee_rate", 5e-4)
     funding = e.get("funding_rate", 1e-4)
@@ -212,8 +220,8 @@ def run_test(cfg, manager, worker, norm_state=None) -> dict:
 
             prev_side = side
             step_axis.append(t)
-            net_curve.append(float(np.mean(equity)))
-            gross_curve.append(float(np.mean(equity + cum_fee)))
+            net_curve.append(float(np.sum(equity)))
+            gross_curve.append(float(np.sum(equity + cum_fee)))
 
             if _k == goal_every - 1:
                 low_steps = mx.minimum(env._steps, T - 1) if hasattr(env, "_steps") else t
@@ -250,7 +258,26 @@ def _returns(equity):
     return np.diff(equity) / (equity[:-1] + 1e-12)
 
 
+def _periods_per_year(cfg) -> float:
+    """Trading periods per year derived from the low-TF bar duration.
+
+    Not a hard-coded 252 (daily): for 5-minute bars this is
+    ``252 * 1440 / 5 = 72576``.
+    """
+    from data import _tf_minutes
+
+    tf = (cfg.get("data") or {}).get("timeframes") or {}
+    bar_min = _tf_minutes(tf.get("low", "5m"))
+    return TRADING_DAYS * 24 * 60 / bar_min
+
+
 def metrics(net, periods_per_year=252):
+    """Risk metrics on a single bar-indexed equity curve.
+
+    ``net`` must be the bar ``net_curve`` from ``run_test`` and
+    ``periods_per_year`` derived from ``_periods_per_year(cfg)`` so Sharpe /
+    Sortino / CAGR use the true bar cadence.
+    """
     rets = _returns(net)
     if len(rets) < 2 or np.std(rets) == 0:
         return {}
@@ -268,6 +295,127 @@ def metrics(net, periods_per_year=252):
         "cagr": cagr,
         "final_equity": float(net[-1]),
         "total_return": float(net[-1] / net[0] - 1.0),
+    }
+
+
+def validate(cfg, manager, worker, n_seeds=2, norm_state=None) -> dict:
+    """Score a trained model on the held-out *validation* bundle.
+
+    Runs ``run_test`` on ``n_seeds`` validation seed offsets (never the locked
+    ``TEST_SEED_OFFSETS``) and returns the mean + spread of the annualized
+    Sharpe. This is the only objective hyperparameter search is allowed to use.
+    """
+    n_seeds = max(1, int(n_seeds))
+    ppy = _periods_per_year(cfg)
+    nets, sharpes = [], []
+    for off in VALID_SEED_OFFSETS[:n_seeds]:
+        r = run_test(cfg, manager, worker, norm_state=norm_state, seed_offset=off)
+        m = metrics(r["net"], periods_per_year=ppy)
+        nets.append(np.asarray(r["net"]))
+        sharpes.append(float(m.get("sharpe", 0.0)))
+    sharpes = np.asarray(sharpes)
+    mean = float(np.mean(sharpes))
+    std = float(np.std(sharpes)) if sharpes.size > 1 else 0.0
+    return {
+        "sharpe_mean": mean,
+        "sharpe_std": std,
+        "sharpe_ci": 1.96 * std / math.sqrt(max(sharpes.size, 1)),
+        "sharpe_list": sharpes.tolist(),
+        "nets": nets,
+        "seed_offsets": list(VALID_SEED_OFFSETS[:n_seeds]),
+    }
+
+
+def _skewness(x) -> float:
+    x = np.asarray(x, dtype=float)
+    if x.size < 3:
+        return 0.0
+    s = float(np.std(x, ddof=1))
+    if s == 0.0:
+        return 0.0
+    return float(np.mean((x - np.mean(x)) ** 3) / s ** 3)
+
+
+def _kurtosis(x) -> float:
+    x = np.asarray(x, dtype=float)
+    if x.size < 4:
+        return 3.0
+    s = float(np.std(x, ddof=1))
+    if s == 0.0:
+        return 3.0
+    return float(np.mean((x - np.mean(x)) ** 4) / s ** 4)
+
+
+def _phi(z) -> float:
+    return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
+
+
+def _probit(p) -> float:
+    """Inverse normal CDF (Acklam's rational approximation, no scipy)."""
+    a = [-39.69683028665376, 220.9460984245205, -275.9285104469687,
+         138.3577518672690, -30.66479806614716, 2.506628277459239]
+    b = [-54.47609879822406, 161.5858368580409, -155.6989798598866,
+         66.80131188771972, -13.28068155288572]
+    c = [-0.007784894002430293, -0.3223964580411365, -2.400758277161838,
+         -2.549732539343734, 4.374664141464968, 2.938163982698783]
+    d = [7.784695709041462e-3, 0.3224671290700398, 2.445134137142996,
+         3.754408661907416]
+    plow, phigh = 0.02425, 1.0 - 0.02425
+    if p < plow:
+        q = math.sqrt(-2.0 * math.log(p))
+        return (((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / (
+            ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1.0)
+        )
+    if p <= phigh:
+        q = p - 0.5
+        r = q * q
+        return (((((a[0] * r + a[1]) * r + a[2]) * r + a[3]) * r + a[4]) * r + a[5]) * q / (
+            ((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r + 1.0
+        )
+    q = math.sqrt(-2.0 * math.log(1.0 - p))
+    return -(((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / (
+        ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1.0)
+    )
+
+
+def dsr(net, periods_per_year=252, n_trials=1) -> dict:
+    """Deflated Sharpe Ratio (Bailey & Lopez de Prado, 2014).
+
+    Corrects the annualized Sharpe for multiple testing (``n_trials`), and
+    non-normal returns via the sample skewness / kurtosis. ``net`` is the
+    bar-indexed equity curve (validation bundle for search trials).
+    """
+    rets = _returns(np.asarray(net))
+    if rets.size < 4:
+        return {"deflated_sharpe": 0.0, "dsr_probability": 0.0,
+                "expected_max_sharpe": 0.0, "sharpe": 0.0}
+    N = rets.size
+    mean, std = float(np.mean(rets)), float(np.std(rets))
+    if std == 0.0:
+        return {"deflated_sharpe": 0.0, "dsr_probability": 0.0,
+                "expected_max_sharpe": 0.0, "sharpe": 0.0}
+    sr = mean / std
+    skew = _skewness(rets)
+    kurt = _kurtosis(rets)
+    var_sr = max((1.0 / N) * (1.0 - skew * sr + (kurt - 1.0) / 4.0 * sr * sr), 1e-12)
+    eul = 0.5772156649015329
+    if n_trials > 1:
+        emax = (1.0 - eul) * _probit(1.0 - 1.0 / n_trials) + eul * _probit(
+            1.0 - 1.0 / (n_trials * math.e)
+        )
+        sr_0 = math.sqrt(var_sr) * emax
+    else:
+        sr_0 = 0.0
+    denom = math.sqrt(max(1.0 - skew * sr + (kurt - 1.0) / 4.0 * sr * sr, 1e-12))
+    z_dsr = (sr - sr_0) * math.sqrt(N - 1) / denom
+    return {
+        "deflated_sharpe": (sr - sr_0) * math.sqrt(periods_per_year),
+        "dsr_probability": float(_phi(z_dsr)),
+        "expected_max_sharpe": sr_0 * math.sqrt(periods_per_year),
+        "sharpe": sr * math.sqrt(periods_per_year),
+        "skewness": skew,
+        "kurtosis": kurt,
+        "n_obs": N,
     }
 
 
@@ -294,6 +442,12 @@ def _config_lines(cfg) -> list[str]:
 
 
 def _trade_stats(trades, base=1000.0):
+    """Descriptive per-trade stats (NOT annualized as a return series).
+
+    Sharpe / Sortino / Calmar are reported only at portfolio level from the
+    bar-indexed net curve (see ``breakdown``); per-trade subgroups return 0
+    for those three columns so no fake ``sqrt(n)`` annualization leaks in.
+    """
     pnls = np.array([float(t.get("realized_pnl", 0.0) or 0.0) for t in trades], dtype=float)
     n = int(pnls.size)
     if n == 0:
@@ -301,27 +455,19 @@ def _trade_stats(trades, base=1000.0):
                     max_dd=0.0, rr=0.0, sortino=0.0, calmar=0.0, pf=0.0)
     wins, losses = pnls[pnls > 0], pnls[pnls < 0]
     net = float(pnls.sum())
-    mean = float(pnls.mean())
-    std = float(pnls.std())
     win_rate = 100.0 * float((pnls > 0).mean())
     avg_win = float(wins.mean()) if wins.size else 0.0
     avg_loss = float(losses.mean()) if losses.size else 0.0
-    sharpe = mean / std * np.sqrt(n) if std > 1e-12 else 0.0
     cum = np.cumsum(pnls)
     peak = np.maximum.accumulate(cum)
-    dd = cum - peak
-    dd_min = float(dd.min())
+    dd_min = float((cum - peak).min())
     max_dd = 100.0 * abs(dd_min) / max(abs(base), 1.0) if abs(dd_min) > 1e-9 else 0.0
     rr = avg_win / abs(avg_loss) if losses.size and abs(avg_loss) > 1e-12 else 0.0
-    down = pnls[pnls < 0]
-    dstd = float(down.std()) if down.size else 0.0
-    sortino = mean / dstd * np.sqrt(n) if dstd > 1e-12 else 0.0
     gw = float(wins.sum()) if wins.size else 0.0
     gl = float(abs(losses.sum())) if losses.size else 0.0
     pf = gw / gl if gl > 1e-12 else (999.0 if gw > 0 else 0.0)
-    calmar = mean / abs(dd_min) if abs(dd_min) > 1e-12 else 0.0
     return dict(num=n, win_rate=win_rate, avg_win=avg_win, avg_loss=avg_loss, net=net,
-                sharpe=sharpe, max_dd=max_dd, rr=rr, sortino=sortino, calmar=calmar, pf=pf)
+                sharpe=0.0, max_dd=max_dd, rr=rr, sortino=0.0, calmar=0.0, pf=pf)
 
 
 def _bd_row(label, st):
@@ -343,7 +489,8 @@ def breakdown(result, path, cfg=None):
     ledger = result["ledger"]
     net = np.asarray(result["net"])
     base = float(net[0]) if net.size else 1000.0
-    m = metrics(net)
+    ppy = _periods_per_year(cfg) if cfg is not None else 252
+    m = metrics(net, periods_per_year=ppy)
     port = _trade_stats(ledger, base=base)
     if m:
         port["sharpe"] = m.get("sharpe", 0.0)
@@ -401,10 +548,12 @@ def breakdown(result, path, cfg=None):
         return "opening act (first 20%)" if frac < 0.2 else "encore (last 20%)" if frac >= 0.8 else "mid-set (20-80%)"
     by_vintage = _bucket(ledger, _vintage, ["opening act (first 20%)", "mid-set (20-80%)", "encore (last 20%)"])
 
-    lines = ["BREAKDOWN", "=========", ""]
+    lines: list[str] = ["BREAKDOWN", "=========", ""]
     if cfg is not None:
         lines += _config_lines(cfg)
         lines.append("")
+    lines.append("Portfolio risk (Sharpe/Sortino/Calmar) is computed from the bar-indexed "
+                 "net curve; subgroup rows report descriptive trade stats only.")
     lines.append(f"portfolio: {port['num']} trades  final_equity={float(net[-1]):.2f}  "
                  f"ret={m.get('total_return', 0):+.2%}  sharpe={port['sharpe']:.3f}  max_dd={port['max_dd']:.2f}%")
     lines.append("")
@@ -761,17 +910,6 @@ def ml_health(csv_path, out_path, title="agent", theme="synthwave", ma=10):
     return out_path
 
 
-def _ledger_equity(ledger, initial_balance=1000.0):
-    """Reconstruct the (closed-trade) equity curves from the ledger only."""
-    trades = sorted(ledger, key=lambda t: float(t.get("closed_at", 0) or 0))
-    pnl = np.array([float(t.get("realized_pnl", 0.0) or 0.0) for t in trades])
-    fees = np.array([float(t.get("fee", 0.0) or 0.0) for t in trades])
-    equity = initial_balance + np.cumsum(pnl)
-    gross = initial_balance + np.cumsum(pnl + fees)
-    xs = np.array([float(t.get("closed_at", 0) or 0) for t in trades])
-    return equity, gross, xs
-
-
 def generate_report(cfg, manager, worker, out_dir, norm_state=None):
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -779,14 +917,17 @@ def generate_report(cfg, manager, worker, out_dir, norm_state=None):
     log.info("report: deterministic test rollout (theme=%s)", theme)
     raw = run_test(cfg, manager, worker, norm_state=norm_state)
     ledger = raw["ledger"]
-    init_bal = float((cfg.get("env") or {}).get("initial_balance", 1000.0))
-    net, gross, xs = _ledger_equity(ledger, init_bal)
+    net = np.asarray(raw["net"])
+    gross = np.asarray(raw["gross"])
+    xs = np.asarray(raw["steps"])
     if net.size == 0:
-        # No closed trades (e.g. a trader that stayed flat): keep the curve
-        # non-empty so downstream metrics/figures can render a flat line.
-        log.info("report: no closed trades; emitting flat equity at initial balance")
-        net = np.array([init_bal, init_bal])
-        gross = np.array([init_bal, init_bal])
+        # No steps (e.g. an empty bundle): keep the curve non-empty so
+        # downstream metrics/figures can render a flat line.
+        init_bal = float((cfg.get("env") or {}).get("initial_balance", 1000.0))
+        n_envs = max(int((cfg.get("data") or {}).get("n_symbols", 1)), 1)
+        log.info("report: no rollout steps; emitting flat equity at initial balance")
+        net = np.array([init_bal * n_envs, init_bal * n_envs])
+        gross = np.array([init_bal * n_envs, init_bal * n_envs])
         xs = np.array([0.0, 1.0], dtype=float)
     result = {
         "ledger": ledger,
@@ -794,12 +935,12 @@ def generate_report(cfg, manager, worker, out_dir, norm_state=None):
         "gross": gross,
         "steps": xs,
     }
-    log.info("report: %d trades, final_equity=%.4f", len(ledger), float(net[-1]) if len(net) else init_bal)
+    log.info("report: %d trades, final_equity=%.4f", len(ledger), float(net[-1]) if len(net) else 0.0)
     write_ledger(ledger, out_dir / "trades.csv")
     breakdown(result, out_dir / "breakdown.txt", cfg)
     figure1(result, out_dir / "figure1.png", theme=theme)
     figure2(result, out_dir / "figure2.png", theme=theme)
     log.debug("report artifacts -> %s", out_dir)
-    m = metrics(net)
+    m = metrics(net, periods_per_year=_periods_per_year(cfg))
     log.debug("report metrics: %s", m)
     return {"out_dir": out_dir, "metrics": m, "n_trades": len(ledger)}

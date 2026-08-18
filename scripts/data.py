@@ -95,7 +95,12 @@ class DataBundle:
 
 
 def _resample(o: OHLCV, n: int) -> OHLCV:
-    """Aggregate every ``n`` low-TF bars into one high-TF bar (open/high/low/close/vol)."""
+    """Aggregate every ``n`` low-TF bars into one high-TF bar (open/high/low/close/vol).
+
+    Causality rule: high-TF window ``i`` spans low-TF bars ``[i*n, (i+1)*n)``
+    and only closes once ``low_steps >= (i+1)*n``. Consumers must read window
+    ``i`` strictly after it closes --- see ``build_high_view`` / ``mgr_obs``.
+    """
     S, T = o.closes.shape
     T_hi = T // n
     if T_hi == 0:
@@ -109,6 +114,32 @@ def _resample(o: OHLCV, n: int) -> OHLCV:
         closes=x[:, :, -1],
         vols=mx.sum(mx.reshape(o.vols[:, :sl], (S, T_hi, n)), axis=-1),
     )
+
+
+def build_high_view(high_features: mx.array) -> mx.array:
+    """Shift high-TF features so that row ``j`` describes window ``j-1``.
+
+    Row ``0`` is a pre-launch placeholder with no dependency on any low-TF
+    bar; row ``j >= 1`` holds the features of the already-closed high-TF
+    window ``j-1``. Combined with ``mgr_obs``' ``low_steps // n_resample``
+    completion index, consumers only ever read windows strictly before the
+    bar that is still forming (causal, no lookahead).
+    """
+    S, T_hi, F = high_features.shape
+    shifted = mx.concatenate([mx.zeros((S, 1, F)), high_features[:, :-1, :]], axis=1)
+    return mx.reshape(shifted, (S * T_hi, F))
+
+
+def mgr_obs(feats_hi, acct, low_steps, sym_off, T_hi, n_resample):
+    """Manager high-TF observation: last *completed* window + account state.
+
+    ``feats_hi`` is the 2-D view from ``build_high_view``; ``low_steps`` is
+    the env step index. Only windows that closed at or before
+    ``low_steps // n_resample`` are visible.
+    """
+    idx = mx.minimum(low_steps // n_resample, T_hi - 1)
+    feats = mx.take(feats_hi, sym_off + idx, axis=0)
+    return mx.concatenate([feats, acct], axis=1)
 
 
 def _lag(x: mx.array, k: int) -> mx.array:

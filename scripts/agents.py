@@ -9,18 +9,55 @@ buffers, optimizers, compiled update steps) come from ``dirty_mlx_ml``.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
+import os
+import subprocess
 import time
+from datetime import datetime
+from pathlib import Path
 
 import mlx.core as mx
+import yaml
 from dirty_mlx_ml.reinforcement import PPO, SAC, VecNormalize
 from mlx.utils import tree_flatten, tree_unflatten
 from tqdm import tqdm
 
-from data import SYMBOLS, generate
+from data import SYMBOLS, build_high_view, generate, mgr_obs
 from env import TradingEnv
 
 log = logging.getLogger("trading")
+
+
+def _plain(obj):
+    """Recursively unwrap Config -> plain dict/list so yaml can dump it."""
+    if isinstance(obj, dict):
+        return {k: _plain(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_plain(v) for v in obj]
+    return obj
+
+
+def config_hash(cfg) -> str:
+    """Stable SHA-256 fingerprint of a resolved config dict."""
+    return hashlib.sha256(yaml.safe_dump(_plain(cfg), sort_keys=True).encode()).hexdigest()
+
+
+def _git_info() -> dict:
+    try:
+        root = Path(__file__).resolve().parents[1]
+        head = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            capture_output=True, text=True,
+        )
+        dirty = subprocess.run(
+            ["git", "-C", str(root), "status", "--porcelain"],
+            capture_output=True, text=True,
+        )
+        return {"HEAD": head.stdout.strip() if head.returncode == 0 else "", "dirty": bool(dirty.stdout.strip())}
+    except Exception:
+        return {"HEAD": "", "dirty": False}
 
 
 def _slice_symbols(n: int) -> dict:
@@ -112,14 +149,17 @@ class JointHRL:
     """Joint two-tier trainer: PPO manager (goals) + SAC worker (execution)."""
 
     def _mgr_obs(self, worker_obs, low_steps):
-        """Manager sees high-TF features + current position/account state."""
-        F = self.worker_env.F
-        high_idx = mx.minimum(low_steps // self.n_resample, self.T_hi - 1)
-        feats = mx.take(self.high_feats2d, self.sym_off_high + high_idx, axis=0)
-        acct = worker_obs[:, F : F + 6]
-        return mx.concatenate([feats, acct], axis=1)
+        """Manager sees the last *completed* high-TF window + account state.
 
-    def __init__(self, cfg, log_dir=None):
+        The manager view is built on ``build_high_view`` so it never reads
+        the high-TF bar that is still forming (causal, no lookahead).
+        """
+        F = self.worker_env.F
+        feats = mgr_obs(self.mgr_high_feats2d, worker_obs[:, F : F + 6],
+                        low_steps, self.sym_off_high, self.T_hi, self.n_resample)
+        return feats
+
+    def __init__(self, cfg, log_dir=None, config_path=None):
         self.cfg = cfg
         self.log_dir = log_dir
         self.bundle = build_bundle(cfg)
@@ -137,10 +177,11 @@ class JointHRL:
         )
         self.mgr_env = make_env(cfg, "discrete", 0, self.bundle)
         self.obs_mgr_dim = self.mgr_env.observation_space.shape[0]
+        self.config_path = str(config_path) if config_path is not None else None
         S, T_hi, F_hi = self.bundle.high_features.shape
         W = self.worker_env.n_envs_per_symbol
         sym_idx = mx.array([s for s in range(S) for _ in range(W)], dtype=mx.int32)
-        self.high_feats2d = mx.reshape(self.bundle.high_features, (S * T_hi, F_hi))
+        self.mgr_high_feats2d = build_high_view(self.bundle.high_features)
         self.sym_off_high = sym_idx * T_hi
         self.T_hi = T_hi
         self.n_resample = self.bundle.n_resample
@@ -312,9 +353,7 @@ class JointHRL:
         sac.logger.close()
         return self
 
-    def save(self, dirpath):
-        import os
-
+    def save(self, dirpath, config_path=None):
         os.makedirs(dirpath, exist_ok=True)
         mx.save_safetensors(
             os.path.join(dirpath, "manager_policy.safetensors"),
@@ -330,11 +369,37 @@ class JointHRL:
             v = mx.array(ns[k])
             flat[k] = v.reshape(-1) if v.ndim == 0 else v
         mx.save_safetensors(os.path.join(dirpath, "worker_norm.safetensors"), flat)
+
+        m_cfg = dict(self.cfg.get("manager", {}))
+        w_cfg = dict(self.cfg.get("worker", {}))
+        cp = config_path or self.config_path
+        manifest = {
+            "config_path": str(cp) if cp is not None else None,
+            "config_hash": config_hash(self.cfg),
+            "seed": self.cfg.get("seed"),
+            "goal_dim": self.goal_dim,
+            "goal_every": self.goal_every,
+            "n_resample": self.n_resample,
+            "manager_obs_dim": self.obs_mgr_dim,
+            "worker_obs_dim": self.worker_env.observation_space.shape[0],
+            "manager": {
+                "n_steps": m_cfg.get("n_steps"),
+                "net_arch": m_cfg.get("net_arch"),
+                "learning_rate": m_cfg.get("learning_rate"),
+            },
+            "worker": {
+                "net_arch": w_cfg.get("net_arch"),
+                "learning_rate": w_cfg.get("learning_rate"),
+                "buffer_size": w_cfg.get("buffer_size"),
+            },
+            "git": _git_info(),
+            "saved_at": datetime.now().isoformat(),
+        }
+        with open(os.path.join(dirpath, "manifest.json"), "w") as fh:
+            json.dump(manifest, fh, indent=2)
         return dirpath
 
     def load(self, dirpath):
-        import os
-
         m = mx.load(os.path.join(dirpath, "manager_policy.safetensors"))
         self.manager.policy.update(tree_unflatten(list(m.items())))
         w = mx.load(os.path.join(dirpath, "worker_actor.safetensors"))

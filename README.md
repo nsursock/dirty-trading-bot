@@ -88,10 +88,12 @@ venv/bin/python scripts/main.py full --config configs/smoke.yaml
 venv/bin/python scripts/main.py train --config configs/normal.yaml
 
 # test the latest checkpoint -> trade ledger + figures
+# (auto-loads the config bound to the checkpoint's manifest.json;
+#  refuses a config mismatch unless --force)
 venv/bin/python scripts/main.py test
 
-# hyperparameter search (multi-tier + pruning)
-venv/bin/python scripts/optim.py --n-trials 20
+# hyperparameter search (multi-tier + pruning, validation bundle only)
+venv/bin/python scripts/optim.py --n-trials 20 --val-seeds 2
 
 # benchmark harness
 venv/bin/python scripts/bench.py correctness|env|joint|sweep
@@ -110,6 +112,7 @@ logs/<timestamp>/
 │   ├── worker_sac.csv
 │   ├── manager_diag.png     # 4x3 diagnostic per agent
 │   ├── worker_diag.png
+│   ├── manifest.json        # config hash, dims, seed, git SHAs (every save)
 │   └── *.safetensors        # policy checkpoints
 └── testing/
     ├── trades.csv           # trade ledger (per reporting.md)
@@ -117,6 +120,30 @@ logs/<timestamp>/
     ├── figure1.png          # equity, returns, drawdown, return dist
     └── figure2.png          # leverage, collateral, long/short, exits
 ```
+
+## Train / validation / test protocol
+
+Evaluation is split into physically disjoint GBM bundles:
+
+- **Seed offset 1** is the *locked final test*. `main.py test` / `full` score it
+  and it is the only number treated as a hold-out result.
+- **Seed offsets 2–5** are the *validation bundle*. `optim.py` scores every
+  Optuna trial on at least two of these seeds (mean ± CI objective) and never
+  reads the locked test. The best trial is additionally deflated with a
+  Deflated Sharpe Ratio (Bailey & López de Prado, 2014) using the total trial
+  count (`logs/optim_*/optim_result.json`).
+
+Final protocol: tune on the validation bundle → retrain the chosen config →
+`main.py test` on the locked test. `test` binds the checkpoint to the exact
+config it was trained under via `manifest.json`; a config you did not train
+with is refused unless you pass `--force`.
+
+Risk metrics (Sharpe / Sortino / CAGR / Calmar) are always computed from the
+bar-indexed `net_curve` of `run_test`, annualized by the low-TF bar duration
+(`252 * 1440 / bar_minutes`, e.g. 72,576/yr for 5-minute bars — not a
+hard-coded 252). Portfolio equity is the sum of per-account equity, and the
+per-trade tables in `breakdown.txt` are descriptive only (no `sqrt(n)`
+annualization on trade PnL).
 
 ## Configuration
 
