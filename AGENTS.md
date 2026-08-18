@@ -21,3 +21,7 @@ This trading bot should use Apple MLX in the hot path.
 # Troubleshooting
 
 If the only nan in the training CSVs happen on the last row, ignore it: it means the episode didn't complete.
+
+# IDE
+
+Don't create a canvas unless I explicitly ask you to.
