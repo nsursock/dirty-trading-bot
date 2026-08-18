@@ -16,6 +16,7 @@ Reference Issue Tracking: Link relevant issue numbers or pull request references
 
 Every python process launch should use venv/bin/python.
 Run python scripts unsandboxed in IDEs.
+Use caffeinate -dims when launching a python process.
 This trading bot should use Apple MLX in the hot path.
 
 # Troubleshooting

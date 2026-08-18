@@ -115,19 +115,27 @@ logs/<timestamp>/
 │   ├── manifest.json        # config hash, dims, seed, git SHAs (every save)
 │   └── *.safetensors        # policy checkpoints
 └── testing/
-    ├── trades.csv           # trade ledger (per reporting.md)
+    ├── trades.csv           # trade ledger, sorted by close time (+ `episode` col)
     ├── breakdown.txt        # tabulate tables by symbol / exit type
-    ├── figure1.png          # equity, returns, drawdown, return dist
-    └── figure2.png          # leverage, collateral, long/short, exits
+    ├── figure1.png          # aggregate equity, returns, drawdown, return dist
+    ├── figure2.png          # aggregate leverage, collateral, long/short, exits
+    ├── figure1_episode_<n>  # per-episode figure1 (one per eval.episodes)
+    └── figure2_episode_<n>  # per-episode figure2 (one per eval.episodes)
 ```
 
 ## Train / validation / test protocol
 
 Evaluation is split into physically disjoint GBM bundles:
 
-- **Seed offset 1** is the *locked final test*. `main.py test` / `full` score it
-  and it is the only number treated as a hold-out result.
-- **Seed offsets 2–5** are the *validation bundle*. `optim.py` scores every
+- **`eval.episodes` episodes on seed offsets 1–8** form the *locked final test*.
+  `main.py test` / `full` run one episode per offset (default 1) and report an
+  aggregate `figure1.png` plus a `figure1_episode_<n>.png` per episode. The
+  aggregate equity curve is the average of the per-episode curves, so it is the
+  single hold-out number that matters. Per-symbol and per-episode overlay
+  curves on the aggregate equity plot are on by default and can be dropped via
+  `report.overlays: false`. Test rollouts and the episode loop show tqdm
+  progress (`test episodes` / `test seed+<n>`).
+- **Seed offsets 10–17** are the *validation bundle*. `optim.py` scores every
   Optuna trial on at least two of these seeds (mean ± CI objective) and never
   reads the locked test. The best trial is additionally deflated with a
   Deflated Sharpe Ratio (Bailey & López de Prado, 2014) using the total trial
@@ -141,7 +149,10 @@ with is refused unless you pass `--force`.
 Risk metrics (Sharpe / Sortino / CAGR / Calmar) are always computed from the
 bar-indexed `net_curve` of `run_test`, annualized by the low-TF bar duration
 (`252 * 1440 / bar_minutes`, e.g. 72,576/yr for 5-minute bars — not a
-hard-coded 252). Portfolio equity is the sum of per-account equity, and the
+hard-coded 252). The portfolio is a nominal ~$1000 book: each `eval` position
+slot (default `max_positions_per_symbol: 1`, configurable) starts at
+`initial_balance` and the portfolio equity is the **mean** of the per-symbol
+account curves (not the sum — summing misstates the book size). The
 per-trade tables in `breakdown.txt` are descriptive only (no `sqrt(n)`
 annualization on trade PnL).
 

@@ -42,7 +42,12 @@ norm:
   gamma: 0.99
 
 report:
-  theme: synthwave
+  theme: ghibli
+  overlays: false
+
+eval:
+  episodes: 2
+  max_positions_per_symbol: 1
 
 train:
   total_timesteps: 4096

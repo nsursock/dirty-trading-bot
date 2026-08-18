@@ -20,6 +20,7 @@ import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from tabulate import tabulate
+from tqdm import tqdm
 
 from data import SYMBOLS, TRADING_DAYS, build_high_view, generate, mgr_obs
 from env import TradingEnv
@@ -28,9 +29,10 @@ log = logging.getLogger("trading")
 
 # The locked final-test seed offsets. Optuna / hyperparameter search must
 # NEVER read these; ``validate`` uses the validation bundle instead.
-TEST_SEED_OFFSETS = (1,)
+# ``main.py test`` / ``full`` replay ``eval.episodes`` of these draws.
+TEST_SEED_OFFSETS = (1, 2, 3, 4, 5, 6, 7, 8)
 # Held-out validation bundle for hyperparameter search (mean +/- CI).
-VALID_SEED_OFFSETS = (2, 3, 4, 5)
+VALID_SEED_OFFSETS = (10, 11, 12, 13, 14, 15, 16, 17)
 
 
 def _np(x) -> np.ndarray:
@@ -50,8 +52,12 @@ def _test_env(cfg, seed_offset=1):
     e = dict(cfg.get("env", {}))
     r = dict(cfg.get("reward", {}))
     h = dict(cfg.get("hrl", {}))
+    ev = dict(cfg.get("eval", {}))
     tf = d.get("timeframes", {})
-    e["n_envs_per_symbol"] = 1
+    # Number of independent position-slots per symbol during evaluation
+    # (one slot can hold at most one position; default 1 slot => max one
+    # open position per symbol).
+    e["n_envs_per_symbol"] = max(1, int(ev.get("max_positions_per_symbol", 1)))
     e["reward_mode"] = r.get("mode", "smoke")
     e["drawdown_penalty"] = r.get("drawdown_penalty", 1.0)
     e["goal_dim"] = h.get("goal_dim", 3)
@@ -133,10 +139,13 @@ def run_test(cfg, manager, worker, norm_state=None, seed_offset=1) -> dict:
     cum_fee = np.zeros(n_envs)
 
     net_curve, gross_curve, step_axis = [], [], []
+    symbol_eq = []
     lev_all, coll_all, sides_all, exits = [], [], [], []
     trade_id = 0
 
     t = 0
+    pbar = tqdm(total=T - 1, desc=f"test seed+{seed_offset}", unit="step",
+                colour="magenta", leave=False)
     while t < T - 1:
         goal, _, _ = manager.policy.get_action(mgr_obs, deterministic=True)
         env.set_goal(_one_hot(goal, goal_dim))
@@ -220,30 +229,63 @@ def run_test(cfg, manager, worker, norm_state=None, seed_offset=1) -> dict:
 
             prev_side = side
             step_axis.append(t)
-            net_curve.append(float(np.sum(equity)))
-            gross_curve.append(float(np.sum(equity + cum_fee)))
+            # Portfolio equity = mean across accounts (each env starts at the
+            # config initial_balance, so the mean curve tracks one $1000 book).
+            net_curve.append(float(np.mean(equity)))
+            gross_curve.append(float(np.mean(equity + cum_fee)))
+            symbol_eq.append(np.asarray(equity))
+            pbar.n = t
+            pbar.refresh()
 
             if _k == goal_every - 1:
                 low_steps = mx.minimum(env._steps, T - 1) if hasattr(env, "_steps") else t
                 mgr_obs = _mgr_obs_test(high_feats, sym_off_hi, worker_obs, low_steps, T_hi, F, n_resample)
 
+    pbar.update(pbar.total - pbar.n)
+    pbar.close()
     log.debug("test rollout done: steps=%d trades=%d final_equity=%.4f", t, len(ledger), net_curve[-1])
+    sym_by_env = np.asarray(sym_idx)
+    per_symbol = None
+    if symbol_eq:
+        # (num_envs, T_steps) -> average across position-slots -> (n_symbols, T_steps)
+        per_symbol = np.stack(symbol_eq, axis=1)
+        if env.n_envs_per_symbol > 1:
+            per_symbol = np.stack([per_symbol[sym_by_env == s].mean(axis=0) for s in range(S)])
     return {
         "ledger": ledger,
         "net": np.asarray(net_curve),
         "gross": np.asarray(gross_curve),
         "steps": np.asarray(step_axis),
+        "per_symbol": per_symbol,
+        "sym_by_env": sym_by_env,
         "leverage": np.asarray(lev_all),
         "collateral": np.asarray(coll_all),
         "sides": sides_all,
         "exits": exits,
+        "seed_offset": seed_offset,
         "env": env,
     }
 
 
+def _sort_ledger(ledger):
+    """Sort trades by close time; still-open trades (no close) go last."""
+
+    def _closed(t):
+        ca = t.get("closed_at")
+        try:
+            return float("inf") if ca is None else float(ca)
+        except (TypeError, ValueError):
+            return float("inf")
+
+    return sorted(
+        ledger,
+        key=lambda t: (_closed(t), str(t.get("symbol", "")), int(t.get("episode", 0) or 0)),
+    )
+
+
 def write_ledger(ledger, path):
     cols = [
-        "trade_id", "symbol", "side", "opened_at", "closed_at", "entry_price",
+        "trade_id", "episode", "symbol", "side", "opened_at", "closed_at", "entry_price",
         "exit_price", "notional", "leverage", "fee", "realized_pnl", "exit_type",
     ]
     with open(path, "w", newline="") as fh:
@@ -508,6 +550,15 @@ def breakdown(result, path, cfg=None):
     by_symbol = sorted({t["symbol"] for t in ledger})
     sym_groups = [(s, _trade_stats([t for t in ledger if t["symbol"] == s], base=base)) for s in by_symbol]
 
+    ep_order = sorted({int(t.get("episode", 0) or 0) for t in ledger})
+    by_episode = []
+    for e in ep_order:
+        ep_trades = [t for t in ledger if int(t.get("episode", 0) or 0) == e]
+        off = next((t.get("seed_offset") for t in ep_trades if t.get("seed_offset") is not None), "?")
+        by_episode.append((f"episode {e} (seed+{off})", _trade_stats(ep_trades, base=base)))
+    if len(ep_order) > 1:
+        by_episode.append(("all", _trade_stats(ledger, base=base)))
+
     by_side = _bucket(ledger, lambda t: t["side"], ["long", "short"])
     by_exit = _bucket(ledger, lambda t: t["exit_type"],
                       ["take_profit", "stop_loss", "market_close", "liquidation"])
@@ -559,6 +610,7 @@ def breakdown(result, path, cfg=None):
     lines.append("")
     for title, groups in [
         ("By symbol", sym_groups),
+        ("By episode", by_episode),
         ("By side", by_side),
         ("By exit", by_exit),
         ("By outcome", by_outcome),
@@ -668,7 +720,7 @@ def _write_png(fig, path, width=1280, height=920, scale=2):
     fig.write_image(str(path), format="png", width=width, height=height, scale=scale)
 
 
-def figure1(result, path, theme="synthwave"):
+def figure1(result, path, theme="synthwave", overlays=True):
     c = _palette(theme)
     net, gross = np.asarray(result["net"]), np.asarray(result["gross"])
     steps = np.asarray(result["steps"])
@@ -695,6 +747,22 @@ def figure1(result, path, theme="synthwave"):
     fig.add_trace(go.Scatter(x=steps, y=net, mode="lines", fill="tonexty",
                              fillcolor=c["magenta_soft"], line=dict(color=c["cyan"], width=0),
                              showlegend=False, hoverinfo="skip"), 1, 1)
+
+    # per-symbol equity (portfolio decomposition, faint)
+    per_symbol = result.get("per_symbol")
+    if overlays and per_symbol is not None and np.asarray(per_symbol).size:
+        for row in np.asarray(per_symbol):
+            fig.add_trace(go.Scatter(x=steps, y=row, mode="lines",
+                                     line=dict(color=c["violet"], width=1.2), opacity=0.35,
+                                     showlegend=False, hoverinfo="skip"), 1, 1)
+    # per-episode equity (multi-episode runs, faint)
+    ep_list = result.get("episodes")
+    if overlays and ep_list:
+        for e in ep_list:
+            fig.add_trace(go.Scatter(x=np.asarray(e["steps"]), y=np.asarray(e["net"]), mode="lines",
+                                     line=dict(color=c["muted"], width=1.2, dash="dot"), opacity=0.5,
+                                     showlegend=False, hoverinfo="skip"), 1, 1)
+
     # glow under net
     fig.add_trace(go.Scatter(x=steps, y=net, mode="lines", line=dict(color=c["cyan"], width=7),
                              opacity=0.2, showlegend=False, hoverinfo="skip"), 1, 1)
@@ -910,37 +978,106 @@ def ml_health(csv_path, out_path, title="agent", theme="synthwave", ma=10):
     return out_path
 
 
+def _episode_offsets(cfg):
+    """Resolve the locked test seed offsets for ``eval.episodes``."""
+    ev = dict(cfg.get("eval") or {})
+    n_episodes = max(1, int(ev.get("episodes", 1)))
+    offsets = list(TEST_SEED_OFFSETS[:n_episodes])
+    if len(offsets) < n_episodes:
+        raise SystemExit(
+            f"eval.episodes={n_episodes} exceeds the {len(TEST_SEED_OFFSETS)} locked "
+            f"test seed offsets; lower eval.episodes"
+        )
+    return offsets
+
+
+def _nonempty(a, init_bal=1000.0):
+    a = np.asarray(a)
+    if a.size:
+        return a
+    return np.array([init_bal, init_bal])
+
+
+def _aggregate_episodes(episodes):
+    """Combine per-episode raw dicts into the portfolio-level report result.
+
+    The portfolio net curve is the mean of the account curves across
+    episodes (index-aligned timelines); per-symbol equity is likewise
+    averaged across episodes. Trades are merged and sorted by close time.
+    """
+    ledger = _sort_ledger([t for e in episodes for t in e["ledger"]])
+    n_ep = max(len(episodes), 1)
+
+    def _mean(values):
+        return np.mean(np.stack(values), axis=0) if len(values) > 1 else values[0]
+
+    agg_per_symbol = None
+    seen = 0
+    for e in episodes:
+        ps = np.asarray(e.get("per_symbol"))
+        if ps is None or ps.size == 0:
+            continue
+        agg_per_symbol = ps if agg_per_symbol is None else agg_per_symbol + ps
+        seen += 1
+    if agg_per_symbol is not None:
+        agg_per_symbol = agg_per_symbol / seen
+
+    return {
+        "ledger": ledger,
+        "net": _mean([_nonempty(e["net"]) for e in episodes]),
+        "gross": _mean([_nonempty(e["gross"]) for e in episodes]),
+        "steps": np.asarray(episodes[0]["steps"]),
+        "per_symbol": agg_per_symbol,
+        "episodes": [
+            {"net": _nonempty(e["net"]), "gross": _nonempty(e["gross"]),
+             "steps": np.asarray(e["steps"])}
+            for e in episodes
+        ],
+        "n_episodes": n_ep,
+    }
+
+
 def generate_report(cfg, manager, worker, out_dir, norm_state=None):
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     theme = (cfg.get("report") or {}).get("theme", "synthwave")
-    log.info("report: deterministic test rollout (theme=%s)", theme)
-    raw = run_test(cfg, manager, worker, norm_state=norm_state)
-    ledger = raw["ledger"]
-    net = np.asarray(raw["net"])
-    gross = np.asarray(raw["gross"])
-    xs = np.asarray(raw["steps"])
-    if net.size == 0:
-        # No steps (e.g. an empty bundle): keep the curve non-empty so
-        # downstream metrics/figures can render a flat line.
-        init_bal = float((cfg.get("env") or {}).get("initial_balance", 1000.0))
-        n_envs = max(int((cfg.get("data") or {}).get("n_symbols", 1)), 1)
-        log.info("report: no rollout steps; emitting flat equity at initial balance")
-        net = np.array([init_bal * n_envs, init_bal * n_envs])
-        gross = np.array([init_bal * n_envs, init_bal * n_envs])
-        xs = np.array([0.0, 1.0], dtype=float)
-    result = {
-        "ledger": ledger,
-        "net": net,
-        "gross": gross,
-        "steps": xs,
-    }
-    log.info("report: %d trades, final_equity=%.4f", len(ledger), float(net[-1]) if len(net) else 0.0)
-    write_ledger(ledger, out_dir / "trades.csv")
+    overlays = bool((cfg.get("report") or {}).get("overlays", True))
+    offsets = _episode_offsets(cfg)
+    log.info("report: %d test episodes (seed offsets %s, theme=%s, overlays=%s)",
+             len(offsets), offsets, theme, overlays)
+
+    episodes = []
+    for ep, off in enumerate(tqdm(offsets, desc="test episodes", unit="ep",
+                                  colour="magenta", leave=False)):
+        raw = run_test(cfg, manager, worker, norm_state=norm_state, seed_offset=off)
+        for t in raw["ledger"]:
+            t["episode"] = ep
+            t["seed_offset"] = off
+        episodes.append(raw)
+
+    result = _aggregate_episodes(episodes)
+    log.info("report: %d episodes %d trades final_equity=%.4f",
+             len(offsets), len(result["ledger"]),
+             float(result["net"][-1]) if len(result["net"]) else 0.0)
+
+    write_ledger(result["ledger"], out_dir / "trades.csv")
     breakdown(result, out_dir / "breakdown.txt", cfg)
-    figure1(result, out_dir / "figure1.png", theme=theme)
+    figure1(result, out_dir / "figure1.png", theme=theme, overlays=overlays)
     figure2(result, out_dir / "figure2.png", theme=theme)
+    for raw in episodes:
+        per_ep = {
+            "ledger": raw["ledger"],
+            "net": _nonempty(raw["net"]),
+            "gross": _nonempty(raw["gross"]),
+            "steps": np.asarray(raw["steps"]),
+            "per_symbol": np.asarray(raw.get("per_symbol"))
+            if np.asarray(raw.get("per_symbol")).size else None,
+        }
+        figure1(per_ep, out_dir / f"figure1_episode_{raw['seed_offset']}.png", theme=theme,
+                overlays=overlays)
+        figure2(per_ep, out_dir / f"figure2_episode_{raw['seed_offset']}.png", theme=theme)
     log.debug("report artifacts -> %s", out_dir)
-    m = metrics(net, periods_per_year=_periods_per_year(cfg))
+    agg_net = result["net"]
+    m = metrics(agg_net, periods_per_year=_periods_per_year(cfg))
     log.debug("report metrics: %s", m)
-    return {"out_dir": out_dir, "metrics": m, "n_trades": len(ledger)}
+    return {"out_dir": out_dir, "metrics": m, "n_trades": len(result["ledger"])}
