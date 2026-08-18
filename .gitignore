@@ -35,3 +35,6 @@ figures/
 milestones/
 prompt.md
 audit/
+
+# Tool state (gh device-id, prompts, scratch)
+.local/
