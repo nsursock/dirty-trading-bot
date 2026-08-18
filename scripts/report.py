@@ -60,6 +60,7 @@ def _test_env(cfg, seed_offset=1):
     e["n_envs_per_symbol"] = max(1, int(ev.get("max_positions_per_symbol", 1)))
     e["reward_mode"] = r.get("mode", "smoke")
     e["drawdown_penalty"] = r.get("drawdown_penalty", 1.0)
+    e["return_basis"] = dict(cfg.get("returns", {})).get("basis", "account")
     e["goal_dim"] = h.get("goal_dim", 3)
     e["action_space"] = "continuous"
     symbols = dict(list(SYMBOLS.items())[: d.get("n_symbols", 4)])
@@ -142,6 +143,9 @@ def run_test(cfg, manager, worker, norm_state=None, seed_offset=1) -> dict:
     symbol_eq = []
     lev_all, coll_all, sides_all, exits = [], [], [], []
     trade_id = 0
+    roc_curve = []
+    eq_prev = np.full(n_envs, init_bal, dtype=float)
+    coll_prev = np.zeros(n_envs)
 
     t = 0
     pbar = tqdm(total=T - 1, desc=f"test seed+{seed_offset}", unit="step",
@@ -185,6 +189,7 @@ def run_test(cfg, manager, worker, norm_state=None, seed_offset=1) -> dict:
                         "entry_price": float(price[i]),
                         "notional": float(notional[i]),
                         "leverage": float(notional[i] / (collateral[i] + 1e-9)),
+                        "collateral": float(collateral[i]),
                         "equity_before": float(equity[i]),
                         "fee": fee_rate * notional[i],
                         "exit_type": "open",
@@ -238,6 +243,15 @@ def run_test(cfg, manager, worker, norm_state=None, seed_offset=1) -> dict:
             net_curve.append(float(np.mean(equity)))
             gross_curve.append(float(np.mean(equity + cum_fee)))
             symbol_eq.append(np.asarray(equity))
+
+            # Collateral-basis portfolio return for this bar:
+            # bar PnL aggregated over the accounts, divided by the collateral
+            # those accounts had deployed at the start of the bar (0 when flat).
+            bar_pnl = float(np.sum(equity - eq_prev))
+            bar_coll = float(np.sum(coll_prev))
+            roc_curve.append(bar_pnl / (bar_coll + 1e-12) if bar_coll > 1e-6 else 0.0)
+            eq_prev = equity
+            coll_prev = collateral
             pbar.n = t
             pbar.refresh()
 
@@ -262,6 +276,7 @@ def run_test(cfg, manager, worker, norm_state=None, seed_offset=1) -> dict:
         "steps": np.asarray(step_axis),
         "per_symbol": per_symbol,
         "sym_by_env": sym_by_env,
+        "roc": np.asarray(roc_curve),
         "leverage": np.asarray(lev_all),
         "collateral": np.asarray(coll_all),
         "sides": sides_all,
@@ -290,7 +305,7 @@ def _sort_ledger(ledger):
 def write_ledger(ledger, path):
     cols = [
         "trade_id", "episode", "symbol", "side", "opened_at", "closed_at", "entry_price",
-        "exit_price", "notional", "leverage", "fee", "realized_pnl", "exit_type",
+        "exit_price", "notional", "leverage", "collateral", "fee", "realized_pnl", "exit_type",
     ]
     with open(path, "w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=cols, extrasaction="ignore")
@@ -317,14 +332,19 @@ def _periods_per_year(cfg) -> float:
     return TRADING_DAYS * 24 * 60 / bar_min
 
 
-def metrics(net, periods_per_year=252):
+def metrics(net, periods_per_year=252, rets=None, basis="account"):
     """Risk metrics on a single bar-indexed equity curve.
 
     ``net`` must be the bar ``net_curve`` from ``run_test`` and
     ``periods_per_year`` derived from ``_periods_per_year(cfg)`` so Sharpe /
-    Sortino / CAGR use the true bar cadence.
+    Sortino / CAGR use the true bar cadence. ``rets`` optionally overrides
+    the per-period return series (e.g. the collateral-basis ROC series) used
+    for Sharpe / Sortino; ``final_equity`` / ``total_return`` / drawdown stay
+    on the dollar equity curve. ``basis`` is reported verbatim.
     """
-    rets = _returns(net)
+    if rets is None or np.asarray(rets).size == 0:
+        rets = _returns(net)
+    rets = np.asarray(rets)
     if len(rets) < 2 or np.std(rets) == 0:
         return {}
     mean, std = np.mean(rets), np.std(rets)
@@ -341,6 +361,7 @@ def metrics(net, periods_per_year=252):
         "cagr": cagr,
         "final_equity": float(net[-1]),
         "total_return": float(net[-1] / net[0] - 1.0),
+        "return_basis": basis,
     }
 
 
@@ -580,9 +601,14 @@ def breakdown(result, path, cfg=None):
         return "flash (<2)" if d < 2 else "scalp (2-5)" if d < 5 else "sprint (5-15)" if d < 15 else "sit (15-60)" if d < 60 else "camp (60+)"
     by_hold = _bucket(ledger, _hold, ["flash (<2)", "scalp (2-5)", "sprint (5-15)", "sit (15-60)", "camp (60+)"])
 
+    ret_basis = (dict(cfg.get("returns", {})) if cfg is not None else {}).get("basis", "account")
+
     def _roe(t):
-        eb = float(t.get("equity_before", 0) or 0)
-        r = 100.0 * (float(t.get("realized_pnl", 0) or 0)) / max(abs(eb), 1e-9)
+        if ret_basis == "collateral":
+            base = float(t.get("collateral", 0) or 0)
+        else:
+            base = float(t.get("equity_before", 0) or 0)
+        r = 100.0 * (float(t.get("realized_pnl", 0) or 0)) / max(abs(base), 1e-9)
         return "multi-R (>=10%)" if r >= 10 else "single-R (1-10%)" if r >= 1 else "scratch (<1%)" if r >= 0 else "loss (<0%)"
     by_roe = _bucket(ledger, _roe, ["scratch (<1%)", "single-R (1-10%)", "multi-R (>=10%)", "loss (<0%)"])
 
@@ -620,7 +646,7 @@ def breakdown(result, path, cfg=None):
         ("By outcome", by_outcome),
         ("By leverage", by_lev),
         ("By hold duration", by_hold),
-        ("By RoE", by_roe),
+        ("By return" if ret_basis == "collateral" else "By RoE", by_roe),
         ("By notional", by_notional),
         ("By fee drag", by_fee),
         ("By trade vintage", by_vintage),
@@ -724,11 +750,15 @@ def _write_png(fig, path, width=1280, height=920, scale=2):
     fig.write_image(str(path), format="png", width=width, height=height, scale=scale)
 
 
-def figure1(result, path, theme="synthwave", overlays=True):
+def figure1(result, path, theme="synthwave", overlays=True, ret_series=None):
     c = _palette(theme)
     net, gross = np.asarray(result["net"]), np.asarray(result["gross"])
     steps = np.asarray(result["steps"])
-    rets = _returns(net)
+    if ret_series is not None and np.asarray(ret_series).size:
+        rets = np.asarray(ret_series)
+    else:
+        rets = _returns(net)
+    rets = rets[: max(len(steps) - 1, 1)]
     if rets.size == 0:
         rets = np.zeros(1)
     peak = np.maximum.accumulate(net)
@@ -1026,15 +1056,24 @@ def _aggregate_episodes(episodes):
     if agg_per_symbol is not None:
         agg_per_symbol = agg_per_symbol / seen
 
+    roc_eps = [np.asarray(e["roc"]) for e in episodes if e.get("roc") is not None]
+    if len(roc_eps) == len(episodes) and roc_eps:
+        roc = np.mean(np.stack([_nonempty(v) for v in roc_eps]), axis=0)
+    elif roc_eps:
+        roc = roc_eps[0]
+    else:
+        roc = np.zeros(1)
+
     return {
         "ledger": ledger,
         "net": _mean([_nonempty(e["net"]) for e in episodes]),
         "gross": _mean([_nonempty(e["gross"]) for e in episodes]),
         "steps": np.asarray(episodes[0]["steps"]),
         "per_symbol": agg_per_symbol,
+        "roc": roc,
         "episodes": [
             {"net": _nonempty(e["net"]), "gross": _nonempty(e["gross"]),
-             "steps": np.asarray(e["steps"])}
+             "steps": np.asarray(e["steps"]), "roc": np.asarray(e.get("roc"))}
             for e in episodes
         ],
         "n_episodes": n_ep,
@@ -1046,9 +1085,10 @@ def generate_report(cfg, manager, worker, out_dir, norm_state=None):
     out_dir.mkdir(parents=True, exist_ok=True)
     theme = (cfg.get("report") or {}).get("theme", "synthwave")
     overlays = bool((cfg.get("report") or {}).get("overlays", True))
+    ret_basis = (cfg.get("returns") or {}).get("basis", "account")
     offsets = _episode_offsets(cfg)
-    log.info("report: %d test episodes (seed offsets %s, theme=%s, overlays=%s)",
-             len(offsets), offsets, theme, overlays)
+    log.info("report: %d test episodes (seed offsets %s, theme=%s, overlays=%s, returns=%s)",
+             len(offsets), offsets, theme, overlays, ret_basis)
 
     episodes = []
     for ep, off in enumerate(tqdm(offsets, desc="test episodes", unit="ep",
@@ -1064,9 +1104,12 @@ def generate_report(cfg, manager, worker, out_dir, norm_state=None):
              len(offsets), len(result["ledger"]),
              float(result["net"][-1]) if len(result["net"]) else 0.0)
 
+    rets = None
+    if ret_basis == "collateral" and np.asarray(result.get("roc")).size > 1:
+        rets = np.asarray(result["roc"])[1:]
     write_ledger(result["ledger"], out_dir / "trades.csv")
     breakdown(result, out_dir / "breakdown.txt", cfg)
-    figure1(result, out_dir / "figure1.png", theme=theme, overlays=overlays)
+    figure1(result, out_dir / "figure1.png", theme=theme, overlays=overlays, ret_series=rets)
     figure2(result, out_dir / "figure2.png", theme=theme)
     for raw in episodes:
         per_ep = {
@@ -1077,11 +1120,14 @@ def generate_report(cfg, manager, worker, out_dir, norm_state=None):
             "per_symbol": np.asarray(raw.get("per_symbol"))
             if np.asarray(raw.get("per_symbol")).size else None,
         }
+        ep_rets = None
+        if ret_basis == "collateral" and np.asarray(raw.get("roc")).size > 1:
+            ep_rets = np.asarray(raw["roc"])[1:]
         figure1(per_ep, out_dir / f"figure1_episode_{raw['seed_offset']}.png", theme=theme,
-                overlays=overlays)
+                overlays=overlays, ret_series=ep_rets)
         figure2(per_ep, out_dir / f"figure2_episode_{raw['seed_offset']}.png", theme=theme)
     log.debug("report artifacts -> %s", out_dir)
     agg_net = result["net"]
-    m = metrics(agg_net, periods_per_year=_periods_per_year(cfg))
+    m = metrics(agg_net, periods_per_year=_periods_per_year(cfg), rets=rets, basis=ret_basis)
     log.debug("report metrics: %s", m)
     return {"out_dir": out_dir, "metrics": m, "n_trades": len(result["ledger"])}

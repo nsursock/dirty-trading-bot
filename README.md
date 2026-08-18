@@ -156,7 +156,7 @@ account curves (not the sum — summing misstates the book size). The
 per-trade tables in `breakdown.txt` are descriptive only (no `sqrt(n)`
 annualization on trade PnL).
 
-## Margin modes
+## Margin and return modes
 
 `env.margin_mode` selects the per-slot margin accounting (`isolated`, default,
 or `cross`):
@@ -174,13 +174,26 @@ accounting and the liquidation/bankruptcy path; true portfolio-wide cross
 margin (many symbols sharing one $1000 account) is a follow-up redesign of the
 per-slot bookkeeping.
 
+`returns.basis` selects the return basis (`account`, default, or `collateral`):
+
+- **account** — every return is measured against total account equity
+  (balance + collateral + unrealized PnL), so a +$100 trade on a $1000 book is
+  a +10% return no matter how much collateral it used.
+- **collateral** — returns are measured against the deployed collateral (ROC).
+  The same +$100 trade on $100 collateral is a +100% return. Flowing through
+  the training reward (per-bar ROC, zero while flat), the breakdown "By return"
+  bucket (PnL ÷ trade collateral), the figure1 return panels, and Sharpe /
+  Sortino. Dollar facts (`final_equity`, drawdown, total_return) stay on the
+  equity curve either way.
+
 Returns scale: expected per-episode moves are small (sub-percent to a few
 percent on the $1000 book). This is by construction of the sizing model —
 `risk_frac` allocates only 1–5% of balance per position and take-profit/
 stop-loss clamp the PnL — and it is currently dominated by fee/funding drag,
 since the trained policies trade nearly every bar (thousands of round trips
-per episode). Improving it is a sizing/trade-frequency question, not a scale
-bug.
+per episode). Improving it is a sizing/trade-frequency question; switching to
+`returns.basis: collateral` reports the same activity at the true leverage
+scale.
 
 ## Configuration
 
@@ -191,6 +204,7 @@ bug.
 data:    { n_symbols, n_steps, dt_days }
 env:     { n_envs_per_symbol, leverage, margin_mode, fee_rate, funding_rate, ... }
 reward:  { mode: smoke|normal, drawdown_penalty }
+returns: { basis: account|collateral }
 train:   { total_timesteps, log_interval }
 hrl:     { goal_every, goal_dim }
 manager: { n_steps, batch_size, net_arch, ... }   # PPO

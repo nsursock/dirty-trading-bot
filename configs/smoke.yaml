@@ -46,6 +46,9 @@ report:
   theme: ghibli
   overlays: false
 
+returns:
+  basis: collateral
+
 eval:
   episodes: 2
   max_positions_per_symbol: 1

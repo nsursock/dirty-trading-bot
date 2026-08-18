@@ -46,6 +46,9 @@ report:
   theme: synthwave
   overlays: false
 
+returns:
+  basis: collateral
+
 eval:
   episodes: 3
   max_positions_per_symbol: 1

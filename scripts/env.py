@@ -65,6 +65,7 @@ class TradingEnv:
         eval_every: int = 32,
         enforce_goal: bool = False,
         margin_mode: str = "isolated",
+        return_basis: str = "account",
         seed: int = 0,
     ):
         features = mx.array(features, dtype=mx.float32)
@@ -112,6 +113,9 @@ class TradingEnv:
         if margin_mode not in ("isolated", "cross"):
             raise ValueError(f"margin_mode must be 'isolated' or 'cross', got {margin_mode!r}")
         self.margin_mode = margin_mode
+        if return_basis not in ("account", "collateral"):
+            raise ValueError(f"return_basis must be 'account' or 'collateral', got {return_basis!r}")
+        self.return_basis = return_basis
         self._step_count = 0
 
         obs_dim = self.F + 6 + self.goal_dim
@@ -221,6 +225,7 @@ class TradingEnv:
         dd_penalty = self.drawdown_penalty
         reward_clip = self.reward_clip
         enforce_goal = self.enforce_goal
+        return_basis = self.return_basis
 
         feats0 = mx.take(feats2d, sym_off, axis=0)
         pos0 = mx.concatenate([mx.ones((num_envs, 1)), mx.zeros((num_envs, 2))], axis=1)
@@ -376,8 +381,19 @@ class TradingEnv:
             else:
                 eq_end = balance + collateral + upnl_end
 
-            log_ret = mx.log(mx.maximum(eq_end, EPS)) - mx.log(mx.maximum(eq_prev, EPS))
             peak2 = mx.maximum(peak_prev, eq_end)
+            if return_basis == "collateral":
+                # Per-step return on the deployed collateral (ROC); flat
+                # accounts (no collateral at step start) earn zero return.
+                pnl = eq_end - eq_prev
+                roc = mx.where(
+                    collateral > EPS,
+                    mx.log(mx.maximum(1.0 + pnl / mx.maximum(collateral, EPS), EPS)),
+                    mx.zeros_like(eq_end),
+                )
+                log_ret = roc
+            else:
+                log_ret = mx.log(mx.maximum(eq_end, EPS)) - mx.log(mx.maximum(eq_prev, EPS))
             if reward_mode == "normal":
                 dd = (peak2 - eq_end) / (peak2 + EPS)
                 reward = log_ret - dd_penalty * dd * dd

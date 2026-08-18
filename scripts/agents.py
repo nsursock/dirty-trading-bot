@@ -81,8 +81,10 @@ def build_bundle(cfg):
 def _env_kwargs(cfg) -> dict:
     e = dict(cfg.get("env", {}))
     r = dict(cfg.get("reward", {}))
+    rs = dict(cfg.get("returns", {}))
     e["reward_mode"] = r.get("mode", "smoke")
     e["drawdown_penalty"] = r.get("drawdown_penalty", 1.0)
+    e["return_basis"] = rs.get("basis", "account")
     return e
 
 

@@ -105,6 +105,28 @@ def test_breakdown_includes_per_episode_section(tmp_path):
     assert "all" in text
 
 
+def test_aggregate_averages_roc_series():
+    from report import _aggregate_episodes
+
+    ep1 = _synthetic_episode(1, seed_off=1)
+    ep2 = _synthetic_episode(2, seed_off=2)
+    ep1["roc"] = np.linspace(0.0, 0.02, 8)
+    ep2["roc"] = np.linspace(0.0, -0.01, 8)
+    agg = _aggregate_episodes([ep1, ep2])
+    assert np.allclose(agg["roc"], (ep1["roc"] + ep2["roc"]) / 2)
+
+
+def test_metrics_accepts_collateral_return_series():
+    from report import metrics
+
+    net = np.array([1000.0, 1001.0, 1002.0, 1003.0])
+    rets = np.array([0.10, -0.05, 0.20])  # collateral-basis ROC series
+    m = metrics(net, periods_per_year=72576.0, rets=rets, basis="collateral")
+    assert m["return_basis"] == "collateral"
+    assert m["sharpe"] == pytest.approx(rets.mean() / (rets.std() + 1e-12) * np.sqrt(72576.0), rel=1e-9)
+    assert m["final_equity"] == pytest.approx(1003.0)  # dollar facts stay on equity
+
+
 def test_figure1_renders_with_per_symbol_and_episode_overlays(tmp_path):
     from report import figure1
 
