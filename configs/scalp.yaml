@@ -52,7 +52,7 @@ norm:
   gamma: 0.99
 
 report:
-  theme: ghibli
+  theme: synthwave
   overlays: false
 
 returns:
