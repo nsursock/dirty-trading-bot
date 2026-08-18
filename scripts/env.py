@@ -1,9 +1,9 @@
 """Vectorized per-symbol perpetuals trading environment (pure MLX, fused step).
 
 Each environment instance trades one symbol with at most one open position
-(flat / long / short) on isolated margin, with taker fees, entry slippage,
-funding accrual, liquidation and bankruptcy truncation. The ``step`` is a
-single ``mx.compile``-fused kernel with no Python loops; the state/time/RNG
+(flat / long / short) on isolated or cross margin, with taker fees, entry
+slippage, funding accrual, liquidation and bankruptcy truncation. The ``step``
+is a single ``mx.compile``-fused kernel with no Python loops; the state/time/RNG
 threading matches ``dirty_mlx_ml.reinforcement`` so PPO and SAC consume it
 directly (SB3-like ``reset`` / ``step`` plus the internal ``_step_fn``
 contract).
@@ -64,6 +64,7 @@ class TradingEnv:
         goal_dim: int = 0,
         eval_every: int = 32,
         enforce_goal: bool = False,
+        margin_mode: str = "isolated",
         seed: int = 0,
     ):
         features = mx.array(features, dtype=mx.float32)
@@ -108,6 +109,9 @@ class TradingEnv:
         self.reward_clip = float(reward_clip)
         self.eval_every = max(int(eval_every), 1)
         self.enforce_goal = bool(enforce_goal)
+        if margin_mode not in ("isolated", "cross"):
+            raise ValueError(f"margin_mode must be 'isolated' or 'cross', got {margin_mode!r}")
+        self.margin_mode = margin_mode
         self._step_count = 0
 
         obs_dim = self.F + 6 + self.goal_dim
@@ -163,7 +167,10 @@ class TradingEnv:
         balance, q, entry, collateral = state[:, 0], state[:, 1], state[:, 2], state[:, 3]
         price = mx.take(self.closes_flat, idx)
         upnl = q * (price - entry)
-        eq = balance + collateral + upnl
+        if self.margin_mode == "cross":
+            eq = balance + upnl  # collateral is an allocation, not locked cash
+        else:
+            eq = balance + collateral + upnl
         pos = mx.stack([mx.abs(q) <= EPS, q > EPS, q < -EPS], axis=1).astype(mx.float32)
         acct = mx.stack(
             [
@@ -240,7 +247,12 @@ class TradingEnv:
             collateral = state[:, 3]
             peak_prev = state[:, 4]
 
-            eq_prev = balance + collateral + q * (price_prev - entry)
+            if self.margin_mode == "cross":
+                # Whole-account equity backs the position; the collateral
+                # column is only an allocation for sizing/leverage reporting.
+                eq_prev = balance + q * (price_prev - entry)
+            else:
+                eq_prev = balance + collateral + q * (price_prev - entry)
 
             upnl = q * (price - entry)
             notional = mx.abs(q) * price
@@ -263,21 +275,36 @@ class TradingEnv:
                 tp_hit = tp_touch & ~sl_touch
                 exit_hit = sl_touch | tp_touch
                 fill_exit = mx.where(sl_hit, sl_px, mx.where(tp_hit, tp_px, price))
-                balance = mx.where(
-                    exit_hit,
-                    balance + collateral + q * (fill_exit - entry) - fee_rate * mx.abs(q) * fill_exit,
-                    balance,
-                )
+                if self.margin_mode == "cross":
+                    balance = mx.where(
+                        exit_hit,
+                        balance + q * (fill_exit - entry) - fee_rate * mx.abs(q) * fill_exit,
+                        balance,
+                    )
+                else:
+                    balance = mx.where(
+                        exit_hit,
+                        balance + collateral + q * (fill_exit - entry) - fee_rate * mx.abs(q) * fill_exit,
+                        balance,
+                    )
                 q = mx.where(exit_hit, 0.0, q)
                 entry = mx.where(exit_hit, 0.0, entry)
                 collateral = mx.where(exit_hit, 0.0, collateral)
 
-            liq = (mx.abs(q) > EPS) & ((collateral + upnl) <= maint * notional)
-            balance = mx.where(
-                liq,
-                balance + mx.maximum(collateral + upnl - liq_fee * notional, 0.0),
-                balance,
-            )
+            if self.margin_mode == "cross":
+                liq = (mx.abs(q) > EPS) & ((balance + q * (price - entry)) <= maint * notional)
+                balance = mx.where(
+                    liq,
+                    mx.maximum(balance + q * (price - entry) - liq_fee * notional, 0.0),
+                    balance,
+                )
+            else:
+                liq = (mx.abs(q) > EPS) & ((collateral + q * (price - entry)) <= maint * notional)
+                balance = mx.where(
+                    liq,
+                    balance + mx.maximum(collateral + q * (price - entry) - liq_fee * notional, 0.0),
+                    balance,
+                )
             q = mx.where(liq, 0.0, q)
             entry = mx.where(liq, 0.0, entry)
             collateral = mx.where(liq, 0.0, collateral)
@@ -303,11 +330,18 @@ class TradingEnv:
 
             side_cur = mx.sign(q)
             close = (mx.abs(q) > EPS) & (side_cur != side)
-            balance = mx.where(
-                close,
-                balance + collateral + q * (price - entry) - fee_rate * mx.abs(q) * price,
-                balance,
-            )
+            if self.margin_mode == "cross":
+                balance = mx.where(
+                    close,
+                    balance + q * (price - entry) - fee_rate * mx.abs(q) * price,
+                    balance,
+                )
+            else:
+                balance = mx.where(
+                    close,
+                    balance + collateral + q * (price - entry) - fee_rate * mx.abs(q) * price,
+                    balance,
+                )
             q = mx.where(close, 0.0, q)
             entry = mx.where(close, 0.0, entry)
             collateral = mx.where(close, 0.0, collateral)
@@ -315,11 +349,21 @@ class TradingEnv:
             open_pos = (side != 0.0) & (mx.abs(q) <= EPS)
             risk_frac = risk_min + t * (risk_max - risk_min)
             lev_used = lev_min + t * (lev_max - lev_min)
-            collateral_new = mx.clip(risk_frac * balance, min_col, max_coll)
+            if self.margin_mode == "cross":
+                # Size off total account equity so unrealized gains compound.
+                size_base = balance + q * (price - entry)
+            else:
+                size_base = balance
+            collateral_new = mx.clip(risk_frac * size_base, min_col, max_coll)
             notional_new = collateral_new * lev_used
             fee_open = fee_rate * notional_new
             fill = price * (1.0 + side * slip)
-            balance = mx.where(open_pos, balance - collateral_new - fee_open, balance)
+            if self.margin_mode == "cross":
+                # Margin is not locked: the account pays only the entry fee,
+                # the whole equity stays available as backing.
+                balance = mx.where(open_pos, balance - fee_open, balance)
+            else:
+                balance = mx.where(open_pos, balance - collateral_new - fee_open, balance)
             collateral = mx.where(open_pos, collateral_new, collateral)
             q = mx.where(open_pos, side * notional_new / (fill + EPS), q)
             entry = mx.where(open_pos, fill, entry)
@@ -327,7 +371,10 @@ class TradingEnv:
             balance = balance - funding * (q * price)
 
             upnl_end = q * (price - entry)
-            eq_end = balance + collateral + upnl_end
+            if self.margin_mode == "cross":
+                eq_end = balance + upnl_end
+            else:
+                eq_end = balance + collateral + upnl_end
 
             log_ret = mx.log(mx.maximum(eq_end, EPS)) - mx.log(mx.maximum(eq_prev, EPS))
             peak2 = mx.maximum(peak_prev, eq_end)

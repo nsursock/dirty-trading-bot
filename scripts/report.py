@@ -164,7 +164,11 @@ def run_test(cfg, manager, worker, norm_state=None, seed_offset=1) -> dict:
             balance = _np(state[:, 0])
             t_idx = np.minimum(_np(env._steps), T - 1)
             price = _np(mx.take(env.closes_flat, env.sym_off + mx.array(t_idx, mx.int32)))
-            equity = balance + collateral + q * (price - entry)
+            if env.margin_mode == "cross":
+                # Poll the account equity exactly like the env does.
+                equity = balance + q * (price - entry)
+            else:
+                equity = balance + collateral + q * (price - entry)
             notional = np.abs(q) * price
             side = np.sign(q).astype(int)
             req = np.where(np.abs(act_np) > side_thr, np.sign(act_np), 0).astype(int)

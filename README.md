@@ -156,6 +156,32 @@ account curves (not the sum — summing misstates the book size). The
 per-trade tables in `breakdown.txt` are descriptive only (no `sqrt(n)`
 annualization on trade PnL).
 
+## Margin modes
+
+`env.margin_mode` selects the per-slot margin accounting (`isolated`, default,
+or `cross`):
+
+- **isolated** — opening a position locks `risk_frac * balance` out of cash
+  into collateral; equity = balance + collateral + unrealized PnL and a losing
+  position is capped by its collateral.
+- **cross** — the whole account equity backs the position: collateral is an
+  allocation for sizing/leverage reporting only, cash is *not* locked, position
+  sizing compounds off total equity, and liquidation keys off account equity
+  falling to the maintenance requirement instead of the position's collateral.
+
+With one position slot per account the two modes differ chiefly in ledger
+accounting and the liquidation/bankruptcy path; true portfolio-wide cross
+margin (many symbols sharing one $1000 account) is a follow-up redesign of the
+per-slot bookkeeping.
+
+Returns scale: expected per-episode moves are small (sub-percent to a few
+percent on the $1000 book). This is by construction of the sizing model —
+`risk_frac` allocates only 1–5% of balance per position and take-profit/
+stop-loss clamp the PnL — and it is currently dominated by fee/funding drag,
+since the trained policies trade nearly every bar (thousands of round trips
+per episode). Improving it is a sizing/trade-frequency question, not a scale
+bug.
+
 ## Configuration
 
 `configs/smoke.yaml` (sub-10s smoke) and `configs/normal.yaml` (full run) drive
@@ -163,7 +189,7 @@ annualization on trade PnL).
 
 ```yaml
 data:    { n_symbols, n_steps, dt_days }
-env:     { n_envs_per_symbol, leverage, fee_rate, funding_rate, ... }
+env:     { n_envs_per_symbol, leverage, margin_mode, fee_rate, funding_rate, ... }
 reward:  { mode: smoke|normal, drawdown_penalty }
 train:   { total_timesteps, log_interval }
 hrl:     { goal_every, goal_dim }

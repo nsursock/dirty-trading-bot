@@ -9,7 +9,7 @@ data:
   regime: mix
 
 env:
-  n_envs_per_symbol: 64
+  n_envs_per_symbol: 2048
   lev_min: 2.0
   lev_max: 10.0
   fee_rate: 0.0005
@@ -25,6 +25,7 @@ env:
   stop_loss: 0.1
   enforce_goal: false
   initial_balance: 1000.0
+  margin_mode: isolated
   size_fraction: 1.0
   side_threshold: 0.2
   trade_knob: 8.5
