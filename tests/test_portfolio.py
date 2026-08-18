@@ -44,11 +44,13 @@ def test_episode_offsets_from_eval_config():
     from report import _episode_offsets, TEST_SEED_OFFSETS
 
     assert _episode_offsets(load(SMOKE)) == list(TEST_SEED_OFFSETS[:2])
-    over = {"eval": {"episodes": len(TEST_SEED_OFFSETS) + 1}}
+    # Episodes beyond the locked draws extend the sequence deterministically
+    # (offsets 9..N) and are never capped by ``len(TEST_SEED_OFFSETS)``.
     from config import Config
 
-    with pytest.raises(SystemExit):
-        _episode_offsets(Config(over))
+    n = len(TEST_SEED_OFFSETS) + 3
+    assert _episode_offsets(Config({"eval": {"episodes": n}})) == list(range(1, n + 1))
+    assert _episode_offsets(Config({"eval": {"episodes": 1}})) == [1]
 
 
 def test_sort_ledger_by_close_time():

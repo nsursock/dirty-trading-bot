@@ -13,6 +13,7 @@ from __future__ import annotations
 import csv
 import logging
 import math
+import random
 from collections import Counter
 from pathlib import Path
 
@@ -29,14 +30,19 @@ log = logging.getLogger("trading")
 
 # The locked final-test seed offsets. Optuna / hyperparameter search must
 # NEVER read these; ``validate`` uses the validation bundle instead.
-# ``main.py test`` / ``full`` replay ``eval.episodes`` of these draws.
+# The first ``len(TEST_SEED_OFFSETS)`` ``main.py test`` / ``full`` episodes
+# replay exactly these draws; ``eval.episodes`` beyond that count extends the
+# sequence deterministically (offsets 9..N) via ``_episode_offsets``.
 TEST_SEED_OFFSETS = (1, 2, 3, 4, 5, 6, 7, 8)
 # Held-out validation bundle for hyperparameter search (mean +/- CI).
 VALID_SEED_OFFSETS = (10, 11, 12, 13, 14, 15, 16, 17)
 
 
 def _np(x) -> np.ndarray:
-    return np.asarray(x.tolist()) if hasattr(x, "tolist") else np.asarray(x)
+    # MLX arrays expose __dlpack__, so np.asarray() maps them directly instead
+    # of forcing a Python-level .tolist() round-trip (the old path cost ~7us
+    # per call and dominated the test rollout).
+    return np.asarray(x)
 
 
 def _one_hot(a, n):
@@ -98,11 +104,14 @@ def _mgr_obs_test(high_feats, sym_off_hi, worker_obs, low_steps, T_hi, F, n_resa
     return mgr_obs(high_feats, acct, low_steps, sym_off_hi, T_hi, n_resample)
 
 
-def run_test(cfg, manager, worker, norm_state=None, seed_offset=1) -> dict:
+def run_test(cfg, manager, worker, norm_state=None, seed_offset=1, pbar=None) -> dict:
     """Deterministic joint rollout -> ledger + per-step series.
 
     ``seed_offset`` selects the GBM bundle draw: the locked final test uses
-    ``TEST_SEED_OFFSETS``; validation uses ``VALID_SEED_OFFSETS``.
+    ``TEST_SEED_OFFSETS``; validation uses ``VALID_SEED_OFFSETS``. When a
+    ``pbar`` is passed it is shared across episodes (one progress bar for the
+    whole test phase) and this call only advances it; otherwise a per-episode
+    bar is created.
     """
     import mlx.core as mx
     from dirty_mlx_ml.reinforcement import VecNormalize
@@ -153,9 +162,24 @@ def run_test(cfg, manager, worker, norm_state=None, seed_offset=1) -> dict:
     lev_all, coll_all, sides_all, exits = [], [], [], []
     trade_id = 0
 
+    # Static lookups pulled to numpy once: closes_flat and sym_off never change,
+    # so the per-step price lookup becomes pure numpy indexing instead of an
+    # mx.take + mx.array round-trip per bar.
+    closes_np = np.asarray(env.closes_flat)
+    sym_off_np = np.asarray(env.sym_off)
+
+    # Pure-MLX rollout: buffer each step's tensors without forcing a host sync,
+    # then materialize the whole trajectory once. Per-step ``np.asarray`` on a
+    # lazy MLX array forces a graph eval + device sync (~200us each); buffering
+    # collapses 4 * T syncs into 4 total.
+    states_buf, acts_buf, steps_buf, exits_buf = [], [], [], []
     t = 0
-    pbar = tqdm(total=T - 1, desc=f"test seed+{seed_offset}", unit="step",
-                colour="magenta", leave=False)
+    own_pbar = pbar is None
+    if own_pbar:
+        pbar = tqdm(total=T - 1, desc=f"test seed+{seed_offset}", unit="step",
+                    colour="magenta", leave=False)
+    else:
+        pbar.set_description(f"test seed+{seed_offset}")
     while t < T - 1:
         goal, _, _ = manager.policy.get_action(mgr_obs, deterministic=True)
         env.set_goal(_one_hot(goal, goal_dim))
@@ -163,128 +187,142 @@ def run_test(cfg, manager, worker, norm_state=None, seed_offset=1) -> dict:
             if t >= T - 1:
                 break
             act = worker._scale_action(worker.actor.sample(worker_obs, deterministic=True)[0])
-            act_np = _np(act).reshape(-1)
             worker_obs, r, done, info = env.step(act)
             t += 1
-
-            state = env._state
-            q = _np(state[:, 1])
-            entry = _np(state[:, 2])
-            collateral = _np(state[:, 3])
-            balance = _np(state[:, 0])
-            t_idx = np.minimum(_np(env._steps), T - 1)
-            price = _np(mx.take(env.closes_flat, env.sym_off + mx.array(t_idx, mx.int32)))
-            if env.margin_mode == "cross":
-                # Poll the account equity exactly like the env does.
-                equity = balance + q * (price - entry)
-            else:
-                equity = balance + collateral + q * (price - entry)
-            notional = np.abs(q) * price
-            side = np.sign(q).astype(int)
-            req = np.where(np.abs(act_np) > side_thr, np.sign(act_np), 0).astype(int)
-            exit_flags = _np(info.get("exit", mx.zeros((n_envs,), mx.int32))).astype(int)
-            _EXIT_NAMES = {0: "market_close", 1: "take_profit", 2: "stop_loss", 3: "liquidation"}
-
-            for i in range(n_envs):
-                if prev_side[i] == 0 and side[i] != 0:
-                    qty = float(notional[i] / (price[i] + 1e-9)) * (1.0 if side[i] > 0 else -1.0)
-                    open_trades[i] = {
-                        "trade_id": trade_id,
-                        "symbol": symbols[sym_idx[i]],
-                        "side": "long" if side[i] > 0 else "short",
-                        "opened_at": t,
-                        "entry_price": float(price[i]),
-                        "qty": qty,
-                        "notional": float(notional[i]),
-                        "leverage": float(notional[i] / (collateral[i] + 1e-9)),
-                        "collateral": float(collateral[i]),
-                        "equity_before": float(equity[i]),
-                        "fee": open_fee_rate * notional[i],
-                        "funding": 0.0,
-                        "exit_type": "open",
-                    }
-                    trade_id += 1
-                elif prev_side[i] != 0 and side[i] == 0:
-                    tr = open_trades[i]
-                    exit_price = float(price[i])
-                    exit_type = _EXIT_NAMES.get(int(exit_flags[i]),
-                                                "market_close" if req[i] == 0 else "liquidation")
-                    if tr is not None:
-                        if exit_type == "liquidation":
-                            # Isolated margin: liquidation loses the full
-                            # collateral (pnl % capped at -100%) plus the
-                            # liquidation fee. Fill happens at the mark price
-                            # with the capped adverse impact.
-                            mark = exit_price * (1.0 - mark_impact * (1.0 if tr["side"] == "long" else -1.0))
-                            realized = -float(tr["collateral"])
-                            exit_fee = liq_fee_rate * abs(tr["qty"]) * mark
-                            exit_price = mark
-                        else:
-                            exit_fee = close_fee_rate * abs(tr["qty"]) * exit_price
-                            realized = (tr["qty"] * (exit_price - tr["entry_price"])
-                                        - tr["fee"] - exit_fee - tr["funding"])
-                        ledger.append(_finish_trade(tr, exit_price, t, exit_type, exit_fee, realized))
-                        book[i] += realized
-                        fees_paid[i] += tr["fee"]
-                        fund_paid[i] += tr["funding"]
-                    open_trades[i] = None
-                    exits.append(exit_type)
-                elif prev_side[i] != 0 and side[i] != prev_side[i]:
-                    tr = open_trades[i]
-                    exit_price = float(price[i])
-                    if tr is not None:
-                        realized = (tr["qty"] * (exit_price - tr["entry_price"])
-                                    - tr["fee"]
-                                    - close_fee_rate * abs(tr["qty"]) * exit_price
-                                    - tr["funding"])
-                        ledger.append(_finish_trade(tr, exit_price, t, "market_close",
-                                                    close_fee_rate * abs(tr["qty"]) * exit_price, realized))
-                        exits.append("market_close")
-                        book[i] += realized
-                        fees_paid[i] += tr["fee"]
-                        fund_paid[i] += tr["funding"]
-                    qty = float(notional[i] / (price[i] + 1e-9)) * (1.0 if side[i] > 0 else -1.0)
-                    open_trades[i] = {
-                        "trade_id": trade_id,
-                        "symbol": symbols[sym_idx[i]],
-                        "side": "long" if side[i] > 0 else "short",
-                        "opened_at": t,
-                        "entry_price": float(price[i]),
-                        "qty": qty,
-                        "notional": float(notional[i]),
-                        "leverage": float(notional[i] / (collateral[i] + 1e-9)),
-                        "equity_before": float(equity[i]),
-                        "fee": open_fee_rate * notional[i],
-                        "funding": 0.0,
-                        "exit_type": "open",
-                    }
-                    trade_id += 1
-
-                if side[i] != 0:
-                    lev_all.append(notional[i] / (collateral[i] + 1e-9))
-                    coll_all.append(collateral[i])
-                    sides_all.append("long" if side[i] > 0 else "short")
-                if open_trades[i] is not None:
-                    # Signed funding: the env does `balance -= funding * (q*price)`,
-                    # so longs pay (+cost) and shorts receive (-cost).
-                    open_trades[i]["funding"] += funding * notional[i] * float(side[i])
-
-            prev_side = side
-            step_axis.append(t)
-            # Portfolio equity = mean of the per-account realized books (each
-            # env starts at the config initial_balance, so the mean curve
-            # tracks one $1000 book that steps only when trades close).
-            net_curve.append(float(np.mean(book)))
-            gross_curve.append(float(np.mean(book + fees_paid + fund_paid)))
-            pbar.n = t
-            pbar.refresh()
-
+            states_buf.append(env._state)
+            acts_buf.append(act)
+            steps_buf.append(env._steps)
+            exits_buf.append(info["exit"])
+            pbar.update(1)
             if _k == goal_every - 1:
                 low_steps = mx.minimum(env._steps, T - 1) if hasattr(env, "_steps") else t
                 mgr_obs = _mgr_obs_test(high_feats, sym_off_hi, worker_obs, low_steps, T_hi, F, n_resample)
 
-    pbar.update(pbar.total - pbar.n)
-    pbar.close()
+    if own_pbar:
+        pbar.update(pbar.total - pbar.n)
+        pbar.close()
+
+    # Materialize the buffered rollout in one shot, then reconstruct the ledger
+    # in numpy.
+    states_np = np.asarray(mx.stack(states_buf))
+    acts_np = np.asarray(mx.stack(acts_buf)).reshape(len(acts_buf), -1)
+    steps_np = np.asarray(mx.stack(steps_buf))
+    exits_np = np.asarray(mx.stack(exits_buf)).astype(int)
+    _EXIT_NAMES = {0: "market_close", 1: "take_profit", 2: "stop_loss", 3: "liquidation"}
+
+    for k in range(len(states_buf)):
+        st = k + 1
+        state_k = states_np[k]
+        balance = state_k[:, 0]
+        q = state_k[:, 1]
+        entry = state_k[:, 2]
+        collateral = state_k[:, 3]
+        act_np = acts_np[k]
+        t_idx = np.minimum(steps_np[k], T - 1)
+        price = closes_np[sym_off_np + t_idx]
+        if env.margin_mode == "cross":
+            # Poll the account equity exactly like the env does.
+            equity = balance + q * (price - entry)
+        else:
+            equity = balance + collateral + q * (price - entry)
+        notional = np.abs(q) * price
+        side = np.sign(q).astype(int)
+        req = np.where(np.abs(act_np) > side_thr, np.sign(act_np), 0).astype(int)
+        exit_flags = exits_np[k]
+
+        for i in range(n_envs):
+            if prev_side[i] == 0 and side[i] != 0:
+                qty = float(notional[i] / (price[i] + 1e-9)) * (1.0 if side[i] > 0 else -1.0)
+                open_trades[i] = {
+                    "trade_id": trade_id,
+                    "symbol": symbols[sym_idx[i]],
+                    "side": "long" if side[i] > 0 else "short",
+                    "opened_at": st,
+                    "entry_price": float(price[i]),
+                    "qty": qty,
+                    "notional": float(notional[i]),
+                    "leverage": float(notional[i] / (collateral[i] + 1e-9)),
+                    "collateral": float(collateral[i]),
+                    "equity_before": float(equity[i]),
+                    "fee": open_fee_rate * notional[i],
+                    "funding": 0.0,
+                    "exit_type": "open",
+                }
+                trade_id += 1
+            elif prev_side[i] != 0 and side[i] == 0:
+                tr = open_trades[i]
+                exit_price = float(price[i])
+                exit_type = _EXIT_NAMES.get(int(exit_flags[i]),
+                                            "market_close" if req[i] == 0 else "liquidation")
+                if tr is not None:
+                    if exit_type == "liquidation":
+                        # Isolated margin: liquidation loses the full
+                        # collateral (pnl % capped at -100%) plus the
+                        # liquidation fee. Fill happens at the mark price
+                        # with the capped adverse impact.
+                        mark = exit_price * (1.0 - mark_impact * (1.0 if tr["side"] == "long" else -1.0))
+                        realized = -float(tr["collateral"])
+                        exit_fee = liq_fee_rate * abs(tr["qty"]) * mark
+                        exit_price = mark
+                    else:
+                        exit_fee = close_fee_rate * abs(tr["qty"]) * exit_price
+                        realized = (tr["qty"] * (exit_price - tr["entry_price"])
+                                    - tr["fee"] - exit_fee - tr["funding"])
+                    ledger.append(_finish_trade(tr, exit_price, st, exit_type, exit_fee, realized))
+                    book[i] += realized
+                    fees_paid[i] += tr["fee"]
+                    fund_paid[i] += tr["funding"]
+                open_trades[i] = None
+                exits.append(exit_type)
+            elif prev_side[i] != 0 and side[i] != prev_side[i]:
+                tr = open_trades[i]
+                exit_price = float(price[i])
+                if tr is not None:
+                    realized = (tr["qty"] * (exit_price - tr["entry_price"])
+                                - tr["fee"]
+                                - close_fee_rate * abs(tr["qty"]) * exit_price
+                                - tr["funding"])
+                    ledger.append(_finish_trade(tr, exit_price, st, "market_close",
+                                                close_fee_rate * abs(tr["qty"]) * exit_price, realized))
+                    exits.append("market_close")
+                    book[i] += realized
+                    fees_paid[i] += tr["fee"]
+                    fund_paid[i] += tr["funding"]
+                qty = float(notional[i] / (price[i] + 1e-9)) * (1.0 if side[i] > 0 else -1.0)
+                open_trades[i] = {
+                    "trade_id": trade_id,
+                    "symbol": symbols[sym_idx[i]],
+                    "side": "long" if side[i] > 0 else "short",
+                    "opened_at": st,
+                    "entry_price": float(price[i]),
+                    "qty": qty,
+                    "notional": float(notional[i]),
+                    "leverage": float(notional[i] / (collateral[i] + 1e-9)),
+                    "collateral": float(collateral[i]),
+                    "equity_before": float(equity[i]),
+                    "fee": open_fee_rate * notional[i],
+                    "funding": 0.0,
+                    "exit_type": "open",
+                }
+                trade_id += 1
+
+            if side[i] != 0:
+                lev_all.append(notional[i] / (collateral[i] + 1e-9))
+                coll_all.append(collateral[i])
+                sides_all.append("long" if side[i] > 0 else "short")
+            if open_trades[i] is not None:
+                # Signed funding: the env does `balance -= funding * (q*price)`,
+                # so longs pay (+cost) and shorts receive (-cost).
+                open_trades[i]["funding"] += funding * notional[i] * float(side[i])
+
+        prev_side = side
+        step_axis.append(st)
+        # Portfolio equity = mean of the per-account realized books (each
+        # env starts at the config initial_balance, so the mean curve
+        # tracks one $1000 book that steps only when trades close).
+        net_curve.append(float(np.mean(book)))
+        gross_curve.append(float(np.mean(book + fees_paid + fund_paid)))
+
     log.debug("test rollout done: steps=%d trades=%d final_equity=%.4f", t, len(ledger), net_curve[-1])
     sym_by_env = np.asarray(sym_idx)
 
@@ -329,7 +367,6 @@ def run_test(cfg, manager, worker, norm_state=None, seed_offset=1) -> dict:
         "sides": sides_all,
         "exits": exits,
         "seed_offset": seed_offset,
-        "env": env,
     }
 
 
@@ -893,6 +930,20 @@ _LOCAL_THEMES = {
 }
 
 
+def _theme_pool() -> list[str]:
+    """All usable theme names: local repo themes + dirty-mkt-data package themes."""
+    from dirty_mkt_data.viz.themes import THEMES
+
+    return sorted(_LOCAL_THEMES) + sorted(THEMES)
+
+
+def resolve_theme(theme: str) -> str:
+    """Resolve a requested theme to a concrete name; ``random`` picks one at random."""
+    if theme == "random":
+        return random.choice(_theme_pool())
+    return theme
+
+
 def _palette(theme: str) -> dict:
     """Map a theme onto the iso-trading-bot ``_C`` palette roles
     (up=positive, down=negative, accent=highlight).
@@ -1245,16 +1296,20 @@ def ml_health(csv_path, out_path, title="agent", theme="synthwave", ma=10):
 
 
 def _episode_offsets(cfg):
-    """Resolve the locked test seed offsets for ``eval.episodes``."""
+    """Resolve the test seed offsets for ``eval.episodes``.
+
+    The first ``len(TEST_SEED_OFFSETS)`` episodes replay the locked final-test
+    draws (offsets 1..8). Any episodes beyond that extend the sequence
+    deterministically (offsets 9..N), so ``eval.episodes`` is not capped by the
+    number of pre-registered draws. Each offset maps to a unique GBM bundle
+    draw via ``seed = cfg.seed + offset``.
+    """
     ev = dict(cfg.get("eval") or {})
     n_episodes = max(1, int(ev.get("episodes", 1)))
-    offsets = list(TEST_SEED_OFFSETS[:n_episodes])
-    if len(offsets) < n_episodes:
-        raise SystemExit(
-            f"eval.episodes={n_episodes} exceeds the {len(TEST_SEED_OFFSETS)} locked "
-            f"test seed offsets; lower eval.episodes"
-        )
-    return offsets
+    locked = list(TEST_SEED_OFFSETS)
+    if n_episodes <= len(locked):
+        return locked[:n_episodes]
+    return locked + list(range(len(locked) + 1, n_episodes + 1))
 
 
 def _nonempty(a, init_bal=1000.0):
@@ -1328,21 +1383,31 @@ def _aggregate_episodes(episodes):
 def generate_report(cfg, manager, worker, out_dir, norm_state=None):
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    theme = (cfg.get("report") or {}).get("theme", "synthwave")
+    theme = resolve_theme((cfg.get("report") or {}).get("theme", "synthwave"))
     overlays = bool((cfg.get("report") or {}).get("overlays", True))
+    ep_figs = bool((cfg.get("report") or {}).get("episode_figures", False))
     ret_basis = (cfg.get("returns") or {}).get("basis", "account")
     offsets = _episode_offsets(cfg)
-    log.info("report: %d test episodes (seed offsets %s, theme=%s, overlays=%s, returns=%s)",
-             len(offsets), offsets, theme, overlays, ret_basis)
+    log.info("report: %d test episodes (seed offsets %s, theme=%s, overlays=%s, episode_figures=%s, returns=%s)",
+             len(offsets), offsets, theme, overlays, ep_figs, ret_basis)
 
     episodes = []
-    for ep, off in enumerate(tqdm(offsets, desc="test episodes", unit="ep",
-                                  colour="magenta", leave=False)):
-        raw = run_test(cfg, manager, worker, norm_state=norm_state, seed_offset=off)
+    per_ep_steps = max(int((cfg.get("data") or {}).get("n_steps", 400)) - 1, 1)
+    pbar = tqdm(total=len(offsets) * per_ep_steps, desc="test phase",
+                unit="step", colour="magenta", leave=True)
+    for ep, off in enumerate(offsets):
+        raw = run_test(cfg, manager, worker, norm_state=norm_state, seed_offset=off, pbar=pbar)
         for t in raw["ledger"]:
             t["episode"] = ep
             t["seed_offset"] = off
         episodes.append(raw)
+        # Each episode builds a fresh GBM bundle + features on the Metal device;
+        # release the MLX allocator cache between draws so long test phases do
+        # not exhaust the Metal heap. ``raw`` holds only numpy arrays, so no
+        # live tensors are dropped.
+        import mlx.core as mx
+        mx.clear_cache()
+    pbar.close()
 
     result = _aggregate_episodes(episodes)
     log.info("report: %d episodes %d trades final_equity=%.4f",
@@ -1356,21 +1421,22 @@ def generate_report(cfg, manager, worker, out_dir, norm_state=None):
     breakdown(result, out_dir / "breakdown.txt", cfg, rets=rets, basis=ret_basis)
     figure1(result, out_dir / "figure1.png", theme=theme, overlays=overlays, ret_series=rets)
     figure2(result, out_dir / "figure2.png", theme=theme)
-    for raw in episodes:
-        per_ep = {
-            "ledger": raw["ledger"],
-            "net": _nonempty(raw["net"]),
-            "gross": _nonempty(raw["gross"]),
-            "steps": np.asarray(raw["steps"]),
-            "per_symbol": np.asarray(raw.get("per_symbol"))
-            if np.asarray(raw.get("per_symbol")).size else None,
-        }
-        ep_rets = None
-        if ret_basis == "collateral" and np.asarray(raw.get("roc")).size > 1:
-            ep_rets = np.asarray(raw["roc"])[1:]
-        figure1(per_ep, out_dir / f"figure1_episode_{raw['seed_offset']}.png", theme=theme,
-                overlays=overlays, ret_series=ep_rets)
-        figure2(per_ep, out_dir / f"figure2_episode_{raw['seed_offset']}.png", theme=theme)
+    if ep_figs:
+        for raw in episodes:
+            per_ep = {
+                "ledger": raw["ledger"],
+                "net": _nonempty(raw["net"]),
+                "gross": _nonempty(raw["gross"]),
+                "steps": np.asarray(raw["steps"]),
+                "per_symbol": np.asarray(raw.get("per_symbol"))
+                if np.asarray(raw.get("per_symbol")).size else None,
+            }
+            ep_rets = None
+            if ret_basis == "collateral" and np.asarray(raw.get("roc")).size > 1:
+                ep_rets = np.asarray(raw["roc"])[1:]
+            figure1(per_ep, out_dir / f"figure1_episode_{raw['seed_offset']}.png", theme=theme,
+                    overlays=overlays, ret_series=ep_rets)
+            figure2(per_ep, out_dir / f"figure2_episode_{raw['seed_offset']}.png", theme=theme)
     log.debug("report artifacts -> %s", out_dir)
     agg_net = result["net"]
     m = metrics(agg_net, periods_per_year=_periods_per_year(cfg), rets=rets, basis=ret_basis)

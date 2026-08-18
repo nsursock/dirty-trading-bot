@@ -9,7 +9,7 @@ data:
   regime: mix
 
 env:
-  n_envs_per_symbol: 2048
+  n_envs_per_symbol: 1024
   lev_min: 2.0
   lev_max: 10.0
   open_fee_rate: 0.0003
@@ -53,6 +53,7 @@ norm:
 
 report:
   theme: synthwave
+  episode_figures: false
   overlays: false
 
 returns:

@@ -53,6 +53,7 @@ norm:
 
 report:
   theme: synthwave
+  episode_figures: false
   overlays: false
 
 returns:

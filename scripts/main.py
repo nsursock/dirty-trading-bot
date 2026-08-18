@@ -1,8 +1,10 @@
 """Entry point — three execution modes.
 
-    python main.py train  [--config configs/normal.yaml]
+    python main.py train  [--config configs/normal.yaml] [--n-envs N] [--timesteps T]
     python main.py test   [--checkpoint logs/<ts>/training] [--config cfg.yaml] [--force]
-    python main.py full   [--config configs/normal.yaml]
+                          [--n-envs N] [--episodes E] [--theme NAME]
+    python main.py full   [--config configs/normal.yaml] [--n-envs N] [--timesteps T]
+                          [--episodes E] [--theme NAME]
 
 Writes a timestamped run folder ``logs/<timestamp>/`` with a copy of the
 source YAML (original filename), ``run.log`` at its root, and ``training/`` /
@@ -18,6 +20,7 @@ different config unless ``--force`` is passed.
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import logging
 import shutil
@@ -28,7 +31,7 @@ import mlx.core as mx  # noqa: F401  (ensure mlx import before dirty_mlx_ml)
 
 from agents import JointHRL, config_hash
 from config import load
-from report import generate_report, ml_health
+from report import generate_report, ml_health, resolve_theme
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -54,6 +57,28 @@ def _setup_logging(run_dir: Path) -> logging.Logger:
 
 def _config_path(args) -> Path:
     return Path(args.config) if args.config else ROOT / "configs" / "smoke.yaml"
+
+
+def _apply_overrides(cfg, args, log) -> None:
+    """Mutate the loaded config with CLI overrides (n_envs, timesteps, episodes, theme).
+
+    ``--n-envs`` drives only the training env count (``env.n_envs_per_symbol``).
+    The eval book is deliberately left at the config's
+    ``eval.max_positions_per_symbol`` (1) so a big training bed never inflates
+    the memory footprint of the test phase.
+    """
+    if args.n_envs is not None:
+        cfg["env"]["n_envs_per_symbol"] = int(args.n_envs)
+        log.info("override: env.n_envs_per_symbol -> %d", args.n_envs)
+    if args.timesteps is not None:
+        cfg["train"]["total_timesteps"] = int(args.timesteps)
+        log.info("override: train.total_timesteps -> %d", args.timesteps)
+    if args.episodes is not None:
+        cfg["eval"]["episodes"] = int(args.episodes)
+        log.info("override: eval.episodes -> %d", args.episodes)
+    if args.theme is not None:
+        cfg["report"]["theme"] = args.theme
+        log.info("override: report.theme -> %s", args.theme)
 
 
 def _copy_config(src: Path, run_dir: Path) -> Path:
@@ -91,7 +116,7 @@ def _train(cfg, run_dir: Path, log, config_path: Path) -> JointHRL:
         log.exception("training failed: %s", e)
         raise
     _save(j, train_dir, config_path=config_path)
-    theme = (cfg.get("report") or {}).get("theme", "synthwave")
+    theme = resolve_theme((cfg.get("report") or {}).get("theme", "synthwave"))
     ml_health(train_dir / "manager_ppo.csv", train_dir / "manager_diag.png", "manager", theme=theme)
     ml_health(train_dir / "worker_sac.csv", train_dir / "worker_diag.png", "worker", theme=theme)
     log.info("training done: artifacts -> %s", train_dir)
@@ -188,8 +213,41 @@ def _assert_dims_against_manifest(j: JointHRL, ckpt: Path, manifest: dict | None
 
 
 def _test(cfg, run_dir: Path, j: JointHRL) -> dict:
+    norm_state = j.worker_env.norm_state
+    _free_training_memory(j)
     return generate_report(cfg, j.manager, j.worker, run_dir / "testing",
-                           norm_state=j.worker_env.norm_state)
+                           norm_state=norm_state)
+
+
+def _free_training_memory(j: JointHRL) -> None:
+    """Release training-side memory before the report phase.
+
+    ``run_test`` only needs ``manager.policy.get_action``,
+    ``worker.actor.sample``/``_scale_action`` and ``norm_state`` — never the
+    rollout environments or the SAC replay buffer. In ``full`` mode the trained
+    ``JointHRL`` stays alive through the report, holding the 1024-env training
+    envs, the replay buffer, and MLX's cached training peak. On a unified-memory
+    Mac (Apple MLX uses system RAM) several parallel jobs each retaining that
+    cache can push the machine into swap, so drop those references and flush the
+    MLX allocator cache before building test envs and figures.
+    """
+    # The agents hold their own references to the training envs.
+    for agent in (j.worker, j.manager):
+        try:
+            agent.env = None
+        except AttributeError:
+            pass
+    try:
+        j.worker.replay = None
+    except AttributeError:
+        pass
+    for attr in ("worker_env", "mgr_env", "bundle"):
+        try:
+            setattr(j, attr, None)
+        except AttributeError:
+            pass
+    gc.collect()
+    mx.clear_cache()
 
 
 def main():
@@ -199,6 +257,14 @@ def main():
     ap.add_argument("--checkpoint", default=None)
     ap.add_argument("--force", action="store_true",
                     help="allow scoring a checkpoint under a config that disagrees with its manifest")
+    ap.add_argument("--n-envs", type=int, default=None,
+                    help="override env.n_envs_per_symbol (training envs only; eval book stays at 1 slot/symbol)")
+    ap.add_argument("--timesteps", type=int, default=None,
+                    help="override train.total_timesteps")
+    ap.add_argument("--episodes", type=int, default=None,
+                    help="override eval.episodes (test episodes)")
+    ap.add_argument("--theme", default=None,
+                    help="override report.theme (e.g. synthwave, ghibli, random)")
     args = ap.parse_args()
 
     run_dir = _run_dir()
@@ -212,6 +278,7 @@ def main():
         ckpt, manifest = None, None
         src = _config_path(args)
     cfg = load(src)
+    _apply_overrides(cfg, args, log)
     copied = _copy_config(src, run_dir)
     log.info("config: %s -> %s", src, copied)
     log.debug("config: %s", dict(cfg) if hasattr(cfg, "items") else cfg)
