@@ -58,6 +58,8 @@ report:
 
 returns:
   basis: collateral
+  freq: daily
+  rf_annual: 0.045
 
 eval:
   episodes: 8

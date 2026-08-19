@@ -68,6 +68,7 @@ class TradingEnv:
         size_fraction: float = 1.0,
         side_threshold: float = 0.2,
         trade_knob: float = 1.0,
+        min_hold_bars: int = 0,
         adaptive_knob: dict | None = None,
         reward_mode: str = "smoke",
         drawdown_penalty: float = 1.0,
@@ -125,6 +126,7 @@ class TradingEnv:
         self.size_fraction = float(size_fraction)
         self.side_threshold = float(side_threshold)
         self.trade_knob = max(float(trade_knob), 1e-3)
+        self.min_hold_bars = max(int(min_hold_bars), 0)
         self.adaptive_knob = adaptive_knob or {}
         ak = self.adaptive_knob
         bpd = max(int(bars_per_day), 1)
@@ -158,6 +160,7 @@ class TradingEnv:
         self.ak_min = float(ak.get("min_mult", 0.01))
         self.ak_max = float(ak.get("max_mult", 100.0))
         self._open_hist = mx.zeros((self.num_envs, self.ak_window), dtype=mx.float32)
+        self._pos_age = mx.zeros((self.num_envs,), dtype=mx.float32)
         self.reward_mode = reward_mode
         self.drawdown_penalty = float(drawdown_penalty)
         self.reward_clip = float(reward_clip)
@@ -250,6 +253,7 @@ class TradingEnv:
         self._prev_done = mx.zeros((self.num_envs,), dtype=mx.bool_)
         if self.ak_enabled:
             self._open_hist = mx.zeros_like(self._open_hist)
+        self._pos_age = mx.zeros((self.num_envs,), dtype=mx.float32)
         return self._obs(self._state, self._steps), {}
 
     def _build_step(self):
@@ -285,6 +289,7 @@ class TradingEnv:
         size_frac = self.size_fraction
         side_thr = self.side_threshold
         trade_knob = self.trade_knob
+        min_hold = self.min_hold_bars
         ak_enabled = self.ak_enabled
         ak_window = self.ak_window
         ak_target = self.ak_target
@@ -312,7 +317,7 @@ class TradingEnv:
         )
         mx.eval(obs_static0, reset_acct)
 
-        def step(state, steps, prev_done, key, action, price_prev, price, high, low, feats, open_hist):
+        def step(state, steps, prev_done, key, action, price_prev, price, high, low, feats, open_hist, pos_age):
             mask = prev_done
             t = mx.where(mask, mx.zeros_like(steps), steps)
             t_next = t + 1
@@ -441,7 +446,12 @@ class TradingEnv:
                 side = mx.where(g_flat, 0.0, side)
 
             side_cur = mx.sign(q)
-            close = (mx.abs(q) > EPS) & (side_cur != side)
+            # Commitment floor: once a position is opened it must be held for
+            # at least ``min_hold_bars`` full bars before a flat/flip jitter
+            # close is honored (counts bars in position, opening bar = 1).
+            # Stop-loss / take-profit / liquidation still fire immediately
+            # because they zero ``q`` above, before this gate.
+            close = (mx.abs(q) > EPS) & (side_cur != side) & (pos_age >= min_hold)
             if self.margin_mode == "cross":
                 balance = mx.where(
                     close,
@@ -479,6 +489,12 @@ class TradingEnv:
             collateral = mx.where(open_pos, collateral_new, collateral)
             q = mx.where(open_pos, side * notional_new / (fill + EPS), q)
             entry = mx.where(open_pos, fill, entry)
+
+            # Bump the hold-age counter: fresh open counts bar 1, a surviving
+            # position gains a bar each step, a flat/closed one sits at zero.
+            in_pos_end = mx.abs(q) > EPS
+            pos_age = mx.where(open_pos, 1.0, mx.where(in_pos_end, pos_age + 1.0, 0.0))
+            pos_age = mx.where(mask, 0.0, pos_age)
 
             if ak_enabled:
                 # Occupancy flag: is this env IN a position at end of bar?
@@ -554,7 +570,7 @@ class TradingEnv:
             if ak_enabled:
                 open_hist = open_hist * (1.0 - m)
 
-            return state2, steps2, done, key, obs, reward, done, truncated, exit_flag, open_hist
+            return state2, steps2, done, key, obs, reward, done, truncated, exit_flag, open_hist, pos_age
 
         t0 = time.time()
         self._step_fn = mx.compile(step)
@@ -574,9 +590,9 @@ class TradingEnv:
             high = mx.take(self.highs_flat, self.sym_off + tn_idx)
             low = mx.take(self.lows_flat, self.sym_off + tn_idx)
         feats = mx.take(self.feats2d, self.sym_off + tn_idx, axis=0)
-        state, steps, prev_done, key, obs, reward, done, truncated, exit_flag, open_hist = self._step_fn(
+        state, steps, prev_done, key, obs, reward, done, truncated, exit_flag, open_hist, pos_age = self._step_fn(
             self._state, self._steps, self._prev_done, self._key, action,
-            price_prev, price, high, low, feats, self._open_hist,
+            price_prev, price, high, low, feats, self._open_hist, self._pos_age,
         )
         self._step_count += 1
         if self._step_count % self.eval_every == 0:
@@ -586,6 +602,7 @@ class TradingEnv:
         self._prev_done = prev_done
         self._key = key
         self._open_hist = open_hist
+        self._pos_age = pos_age
         return obs, reward.astype(mx.float32), done, {
             "timeouts": truncated.astype(mx.float32),
             "exit": exit_flag,

@@ -7,6 +7,7 @@ data:
     low: 5m
     high: 4h
   regime: mix
+  ar: 0.0
 
 env:
   n_envs_per_symbol: 4
@@ -58,6 +59,8 @@ report:
 
 returns:
   basis: collateral
+  freq: daily
+  rf_annual: 0.045
 
 eval:
   episodes: 2

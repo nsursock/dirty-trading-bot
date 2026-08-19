@@ -19,7 +19,7 @@ from dataclasses import dataclass
 
 import mlx.core as mx
 from dirty_mkt_data import Generator
-from dirty_mkt_data.core.gbm import GBM
+from dirty_mkt_data.core.argbm import ARGBM
 from dirty_mkt_data.eval.rolling import rolling_mean
 from dirty_mkt_data.viz.ohlcv import OHLCV, from_dataset
 from tqdm import tqdm
@@ -227,6 +227,7 @@ def generate(
     base_volume: float = 1_000_000.0,
     regime: str = "bull",
     dt: float | None = None,
+    ar_coef: float = 0.0,
 ) -> DataBundle:
     params = SYMBOLS if symbols is None else symbols
     names = tuple(params)
@@ -253,6 +254,8 @@ def generate(
         "data: generating %d symbols x %d low-TF(%sm) steps, high-TF(%sm) x%d, regime=%s (seed=%d, dt=%.2e)",
         len(names), n_steps, low_min, high_min, n, regime, seed, dt,
     )
+    if ar_coef:
+        log.info("data: injecting AR(1) alpha phi=%.2f into GBM log-returns", ar_coef)
 
     arrays = {k: [] for k in ("opens", "highs", "lows", "closes", "vols")}
     t_gen = time.monotonic()
@@ -260,7 +263,10 @@ def generate(
         t0 = time.monotonic()
         mu, sigma, s0 = params[name]
         log.debug("data: symbol=%s mu=%.4f sigma=%.4f s0=%.4f", name, mu, sigma, s0)
-        ds = Generator(GBM(mu=mu, sigma=sigma, s0=s0, dt=dt), seed=seed).sample(
+        # ARGBM(phi=0) is exactly GBM (drift + iid noise), so the single model
+        # covers the null and every injected-alpha strength.
+        model = ARGBM(mu=mu, sigma=sigma, s0=s0, dt=dt, phi=ar_coef)
+        ds = Generator(model, seed=seed).sample(
             n_steps, n_paths=1, run_id=i
         )
         o = from_dataset(ds, sigma=sigma, dt=dt, base_volume=base_volume, key=keys[i])

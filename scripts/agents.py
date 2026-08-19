@@ -91,6 +91,7 @@ def build_bundle(cfg):
         low_tf=tf.get("low", 5),
         high_tf=tf.get("high", 240),
         regime=d.get("regime", "bull"),
+        ar_coef=d.get("ar", 0.0),
     )
 
 

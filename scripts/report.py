@@ -82,6 +82,7 @@ def _test_env(cfg, seed_offset=1):
         low_tf=tf.get("low", 5),
         high_tf=tf.get("high", 240),
         regime=d.get("regime", "bull"),
+        ar_coef=d.get("ar", 0.0),
     )
     log.info("test seed+%d: GBM bundle generated (n_steps=%d, n_resample=%d, low=%s high=%s)",
              seed_offset, bundle.features.shape[1], bundle.n_resample,
@@ -176,6 +177,7 @@ def run_test(cfg, manager, worker, norm_state=None, seed_offset=1, pbar=None,
     fund_paid = np.zeros(n_envs, dtype=float)
 
     net_curve, gross_curve, step_axis = [], [], []
+    mtm_curve = []
     lev_all, coll_all, sides_all, exits = [], [], [], []
     trade_id = 0
 
@@ -270,6 +272,7 @@ def run_test(cfg, manager, worker, norm_state=None, seed_offset=1, pbar=None,
                     "leverage": float(notional[i] / (collateral[i] + 1e-9)),
                     "collateral": float(collateral[i]),
                     "equity_before": float(equity[i]),
+                    "entry_conviction": float(abs(act_np[i])),
                     "fee": open_fee_rate * notional[i],
                     "funding": 0.0,
                     "exit_type": "open",
@@ -326,6 +329,7 @@ def run_test(cfg, manager, worker, norm_state=None, seed_offset=1, pbar=None,
                     "leverage": float(notional[i] / (collateral[i] + 1e-9)),
                     "collateral": float(collateral[i]),
                     "equity_before": float(equity[i]),
+                    "entry_conviction": float(abs(act_np[i])),
                     "fee": open_fee_rate * notional[i],
                     "funding": 0.0,
                     "exit_type": "open",
@@ -348,6 +352,7 @@ def run_test(cfg, manager, worker, norm_state=None, seed_offset=1, pbar=None,
         # tracks one $1000 book that steps only when trades close).
         net_curve.append(float(np.mean(book)))
         gross_curve.append(float(np.mean(book + fees_paid + fund_paid)))
+        mtm_curve.append(float(np.mean(equity)))
 
     log.debug("test rollout done: steps=%d trades=%d final_equity=%.4f", t, len(ledger), net_curve[-1])
     log.debug("test seed+%d: ledger/reconstruction phase %.2fs this episode", seed_offset,
@@ -384,6 +389,7 @@ def run_test(cfg, manager, worker, norm_state=None, seed_offset=1, pbar=None,
         "ledger": ledger,
         "net": np.asarray(net_curve),
         "gross": np.asarray(gross_curve),
+        "mtm": np.asarray(mtm_curve),
         "steps": np.asarray(step_axis),
         "per_symbol": per_symbol,
         "sym_by_env": sym_by_env,
@@ -417,7 +423,8 @@ def _sort_ledger(ledger):
 def write_ledger(ledger, path):
     cols = [
         "trade_id", "episode", "symbol", "side", "opened_at", "closed_at", "entry_price",
-        "exit_price", "notional", "leverage", "collateral", "fee", "funding", "realized_pnl", "exit_type",
+        "exit_price", "notional", "leverage", "collateral", "entry_conviction",
+        "fee", "funding", "realized_pnl", "exit_type",
     ]
     with open(path, "w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=cols, extrasaction="ignore")
@@ -444,36 +451,101 @@ def _periods_per_year(cfg) -> float:
     return TRADING_DAYS * 24 * 60 / bar_min
 
 
-def metrics(net, periods_per_year=252, rets=None, basis="account"):
-    """Risk metrics on a single bar-indexed equity curve.
+_FREQ_PPY: dict[str, float] = {
+    "1m": 252 * 24 * 60,
+    "5m": 252 * 24 * 12,
+    "15m": 252 * 24 * 4,
+    "30m": 252 * 24 * 2,
+    "1h": 252 * 24,
+    "4h": 252 * 6,
+    "1d": 252,
+    "daily": 252,
+    "1w": 52,
+    "weekly": 52,
+}
 
-    ``net`` must be the bar ``net_curve`` from ``run_test`` and
-    ``periods_per_year`` derived from ``_periods_per_year(cfg)`` so Sharpe /
-    Sortino / CAGR use the true bar cadence. ``rets`` optionally overrides
-    the per-period return series (e.g. the collateral-basis ROC series) used
-    for Sharpe / Sortino; ``final_equity`` / ``total_return`` / drawdown stay
-    on the dollar equity curve. ``basis`` is reported verbatim.
+
+def _resample_equity(net, periods_per_year, freq):
+    """Aggregate a bar-indexed equity curve into ``freq`` simple returns.
+
+    Equity is marked at the close of every ``freq`` window and the per-window
+    return is ``end/start - 1``, so Sharpe / Sortino are computed on portfolio
+    returns at the reporting cadence instead of per-bar steps (which are
+    mostly flat plateaus between trade closes). Returns ``(None, ppy)`` when
+    ``freq`` is coarser than the data or there are fewer than two windows.
+    """
+    fppy = _FREQ_PPY.get(freq)
+    if fppy is None or fppy <= 0:
+        raise ValueError(f"unknown reporting frequency: {freq!r}")
+    bars_per_agg = max(round(periods_per_year / fppy), 1)
+    if bars_per_agg <= 1:
+        return None, periods_per_year
+    n = len(net)
+    starts = net[np.arange(0, n - 1, bars_per_agg)]
+    ends = net[np.minimum(np.arange(bars_per_agg, n, bars_per_agg), n - 1)]
+    k = min(len(starts), len(ends))
+    if k < 2:
+        return None, periods_per_year
+    return ends[:k] / starts[:k] - 1.0, fppy
+
+
+def metrics(net, periods_per_year=252, rets=None, basis="account",
+            rf_annual=0.0, freq="bar"):
+    """Risk metrics on a single equity curve.
+
+    ``net`` must be the bar ``net_curve`` from ``run_test``. ``periods_per_year``
+    is the native bar cadence from ``_periods_per_year(cfg)``.
+
+    ``freq`` picks the reporting cadence for Sharpe / Sortino: ``"bar"`` keeps
+    the native per-bar returns (legacy behavior), anything in ``_FREQ_PPY``
+    (e.g. ``"daily"``, ``"1h"``) aggregates the equity curve to that frequency
+    first — 5-minute bars annualized by ``sqrt(72576)`` report a Sharpe that
+    ignores the flat plateaus between closes. ``rf_annual`` is subtracted as a
+    per-period risk-free rate. When ``freq != "bar"`` the return series is
+    derived from the equity curve (a true portfolio return), regardless of
+    ``rets``; at ``freq="bar"`` ``rets`` (e.g. the collateral-basis ROC series)
+    is used as-is.
+
+    ``final_equity`` / ``total_return`` / ``max_drawdown`` / ``cagr`` stay on
+    the dollar equity curve. ``sortino`` is ``None`` when the sample has fewer
+    than two downside periods (or zero downside dispersion) — it is undefined,
+    not a lucky huge number.
     """
     if rets is None or np.asarray(rets).size == 0:
         rets = _returns(net)
-    rets = np.asarray(rets)
+    rets = np.asarray(rets, dtype=float)
     if len(rets) < 2 or np.std(rets) == 0:
         return {}
-    mean, std = np.mean(rets), np.std(rets)
-    downside = rets[rets < 0]
-    dstd = np.std(downside) if len(downside) else 0.0
+    ppy_bar = periods_per_year
+    if freq != "bar":
+        agg, ppy = _resample_equity(np.asarray(net, dtype=float), periods_per_year, freq)
+        if agg is not None:
+            rets = agg
+            periods_per_year = ppy
+    excess = rets - rf_annual / periods_per_year
+    mean, std = float(np.mean(excess)), float(np.std(excess))
+    if std <= 1e-12:
+        return {}
+    down = excess[excess < 0]
+    sortino = None
+    if len(down) >= 2:
+        dstd = float(np.std(down))
+        if dstd > 1e-12:
+            sortino = mean / (dstd + 1e-12) * np.sqrt(periods_per_year)
     peak = np.maximum.accumulate(net)
     dd = (peak - net) / peak
-    years = len(net) / periods_per_year
+    years = len(net) / ppy_bar
     cagr = (net[-1] / net[0]) ** (1.0 / years) - 1.0 if years > 0 and net[0] > 0 else 0.0
     return {
         "sharpe": mean / (std + 1e-12) * np.sqrt(periods_per_year),
-        "sortino": mean / (dstd + 1e-12) * np.sqrt(periods_per_year),
+        "sortino": sortino,
         "max_drawdown": float(np.max(dd)),
         "cagr": cagr,
         "final_equity": float(net[-1]),
         "total_return": float(net[-1] / net[0] - 1.0),
         "return_basis": basis,
+        "freq": freq,
+        "rf_annual": rf_annual,
     }
 
 
@@ -654,7 +726,9 @@ def _trade_stats(trades, base=1000.0):
     rr = avg_win / abs(avg_loss) if losses.size and abs(avg_loss) > 1e-12 else 0.0
     gw = float(wins.sum()) if wins.size else 0.0
     gl = float(abs(losses.sum())) if losses.size else 0.0
-    pf = gw / gl if gl > 1e-12 else (999.0 if gw > 0 else 0.0)
+    # Profit factor is undefined when every trade wins (no losses to divide
+    # by). Report None instead of an impossible "999".
+    pf = (gw / gl) if gl > 1e-12 else (None if gw > 0 else 0.0)
     std = float(pnls.std())
     sharpe = float(pnls.mean()) / std if n > 1 and std > 1e-12 else 0.0
     dstd = float(losses.std()) if losses.size > 1 else 0.0
@@ -666,10 +740,14 @@ def _trade_stats(trades, base=1000.0):
 
 
 def _bd_row(label, st):
+    pf = st["pf"]
+    pf_fmt = "" if pf is None else f"{pf:.4f}"
+    sortino = st["sortino"]
+    sortino_fmt = "" if sortino is None else f"{sortino:.4f}"
     return [label, st["num"], round(st["win_rate"], 2), round(st["avg_win"], 4),
             round(st["avg_loss"], 4), round(st["net"], 4), round(st["sharpe"], 4),
-            round(st["max_dd"], 2), round(st["rr"], 4), round(st["sortino"], 4),
-            round(st["calmar"], 4), round(st["pf"], 4)]
+            round(st["max_dd"], 2), round(st["rr"], 4), sortino_fmt,
+            round(st["calmar"], 4), pf_fmt]
 
 
 def _bd_table(title, groups, portfolio):
@@ -686,7 +764,10 @@ def breakdown(result, path, cfg=None, rets=None, basis="account"):
     net = np.asarray(result["net"])
     base = float(net[0]) if net.size else 1000.0
     ppy = _periods_per_year(cfg) if cfg is not None else 252
-    m = metrics(net, periods_per_year=ppy, rets=rets, basis=basis)
+    ret_freq = (cfg.get("returns") or {}).get("freq", "daily") if cfg is not None else "bar"
+    rf_annual = float((cfg.get("returns") or {}).get("rf_annual", 0.045)) if cfg is not None else 0.0
+    m = metrics(net, periods_per_year=ppy, rets=rets, basis=basis,
+                rf_annual=rf_annual, freq=ret_freq)
     port = _trade_stats(ledger, base=base)
     if m:
         port["sharpe"] = m.get("sharpe", 0.0)
@@ -1121,7 +1202,7 @@ def figure1(result, path, theme="synthwave", overlays=True, ret_series=None):
     coll = np.array([float(t.get("collateral", 0.0) or 0.0) for t in result["ledger"]], dtype=float)
     ys = np.where(coll > 1e-9, np.array([float(t.get("realized_pnl", 0.0) or 0.0) for t in result["ledger"]])
                   / np.maximum(coll, 1e-9), 0.0)
-    liq = np.array([t.get("exit_type") == "liquidation" for t in result["ledger"]])
+    liq = np.array([t.get("exit_type") == "liquidation" for t in result["ledger"]]).astype(bool)
     trade_rets = ys  # full-resolution per-trade returns for the histogram
     # Rendering is O(trades): with ~100k+ closes (large episodes / stochastic
     # rollouts) a marker per trade becomes the dominant report cost. Downsample
@@ -1441,6 +1522,8 @@ def generate_report(cfg, manager, worker, out_dir, norm_state=None, deterministi
     overlays = bool((cfg.get("report") or {}).get("overlays", True))
     ep_figs = bool((cfg.get("report") or {}).get("episode_figures", False))
     ret_basis = (cfg.get("returns") or {}).get("basis", "account")
+    ret_freq = (cfg.get("returns") or {}).get("freq", "daily")
+    rf_annual = float((cfg.get("returns") or {}).get("rf_annual", 0.045))
     if deterministic is None:
         deterministic = bool((cfg.get("eval") or {}).get("deterministic", True))
     offsets = _episode_offsets(cfg)
@@ -1510,6 +1593,18 @@ def generate_report(cfg, manager, worker, out_dir, norm_state=None, deterministi
               n_ep_figs, time.monotonic() - t_figs)
     log.debug("report artifacts -> %s", out_dir)
     agg_net = result["net"]
-    m = metrics(agg_net, periods_per_year=_periods_per_year(cfg), rets=rets, basis=ret_basis)
+    m = metrics(agg_net, periods_per_year=_periods_per_year(cfg), rets=rets, basis=ret_basis,
+                rf_annual=rf_annual, freq=ret_freq)
+    # Each episode is an independent data draw (different seed offset): report
+    # its own risk metrics too so a single pooled Sharpe is not mistaken for a
+    # stable estimate (mean +/- spread across seeds is the honest headline).
+    per_episode = []
+    for raw in episodes:
+        en = np.asarray(raw["net"])
+        em = metrics(en, periods_per_year=_periods_per_year(cfg), rets=None,
+                     basis=ret_basis, rf_annual=rf_annual, freq=ret_freq)
+        em["seed_offset"] = raw["seed_offset"]
+        per_episode.append(em)
+    m["per_episode"] = per_episode
     log.debug("report metrics: %s", m)
     return {"out_dir": out_dir, "metrics": m, "n_trades": len(result["ledger"])}

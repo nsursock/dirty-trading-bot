@@ -1,17 +1,20 @@
 seed: 42
-
+# Experiment: AR(1) alpha. regime=neutral (mu=0) and ar=0.35 injects a
+# momentum edge into the GBM log-returns (variance-preserving). The only
+# alpha in the data is short-horizon autocorrelation the bot could trade.
 data:
-  n_symbols: 8
-  n_steps: 17280
+  n_symbols: 6
+  n_steps: 2520
   timeframes:
     low: 5m
-    high: 30m
-  regime: mix
+    high: 4h
+  regime: neutral
+  ar: 0.35
 
 env:
-  n_envs_per_symbol: 256
+  n_envs_per_symbol: 24
   lev_min: 2.0
-  lev_max: 150.0
+  lev_max: 20.0
   open_fee_rate: 0.0003
   close_fee_rate: 0.0006
   slippage_bps: 1.0
@@ -30,18 +33,18 @@ env:
   risk_max: 0.05
   use_take_profit: true
   use_stop_loss: true
-  take_profit: 0.01
-  stop_loss: 0.008
+  take_profit: 0.05
+  stop_loss: 0.03
   enforce_goal: false
   initial_balance: 1000.0
   margin_mode: isolated
   size_fraction: 1.0
   side_threshold: 0.2
-  trade_knob: 2.5
+  trade_knob: 3.0
 
 reward:
-  mode: normal
-  drawdown_penalty: 1.0
+  mode: smoke
+  drawdown_penalty: 0.0
   reward_clip: 10.0
 
 norm:
@@ -62,25 +65,16 @@ returns:
   rf_annual: 0.045
 
 eval:
-  episodes: 8
+  episodes: 3
   max_positions_per_symbol: 1
-  deterministic: true
-  adaptive_knob:
-    active: on
-    window_days: 3
-    occupancy_target: 0.15
-    tolerance: 0.02
-    p_gain: 1.5
-    min_mult: 0.01
-    max_mult: 100.0
 
 train:
-  total_timesteps: 20000000
+  total_timesteps: 750000
   log_interval: 1
-  log_every: 200000
+  log_every: 50000
 
 hrl:
-  goal_every: 6
+  goal_every: 8
   goal_dim: 3
 
 manager:

@@ -105,7 +105,7 @@ venv/bin/python scripts/main.py test
 venv/bin/python scripts/optim.py --n-trials 20 --val-seeds 2
 
 # benchmark harness
-venv/bin/python scripts/bench.py correctness|env|joint|sweep
+venv/bin/python utils/bench.py correctness|env|joint|sweep
 
 # render synthetic OHLCV candlesticks
 venv/bin/python utils/inspect_data.py --steps 100

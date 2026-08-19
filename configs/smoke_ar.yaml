@@ -1,17 +1,25 @@
+# AR(1)-alpha smoke experiment: pure momentum edge, no drift.
+#
+# GBM baseline iid log-returns are replaced by an AR(1) process with
+# phi=0.35 (variance-preserving: per-step return vol is unchanged). Regime is
+# "neutral" (mu=0 for every symbol) so the *only* alpha in the data is the
+# autocorrelated move structure — a clean test of whether the HRL stack can
+# extract and compound a momentum signal the GBM null model cannot offer.
 seed: 42
 
 data:
-  n_symbols: 8
-  n_steps: 17280
+  n_symbols: 4
+  n_steps: 400
   timeframes:
     low: 5m
-    high: 30m
-  regime: mix
+    high: 4h
+  regime: neutral
+  ar: 0.35
 
 env:
-  n_envs_per_symbol: 256
+  n_envs_per_symbol: 4
   lev_min: 2.0
-  lev_max: 150.0
+  lev_max: 20.0
   open_fee_rate: 0.0003
   close_fee_rate: 0.0006
   slippage_bps: 1.0
@@ -30,17 +38,17 @@ env:
   risk_max: 0.05
   use_take_profit: true
   use_stop_loss: true
-  take_profit: 0.01
-  stop_loss: 0.008
+  take_profit: 0.05
+  stop_loss: 0.03
   enforce_goal: false
   initial_balance: 1000.0
   margin_mode: isolated
   size_fraction: 1.0
   side_threshold: 0.2
-  trade_knob: 2.5
+  trade_knob: 4.5
 
 reward:
-  mode: normal
+  mode: smoke
   drawdown_penalty: 1.0
   reward_clip: 10.0
 
@@ -62,7 +70,7 @@ returns:
   rf_annual: 0.045
 
 eval:
-  episodes: 8
+  episodes: 2
   max_positions_per_symbol: 1
   deterministic: true
   adaptive_knob:
@@ -75,34 +83,34 @@ eval:
     max_mult: 100.0
 
 train:
-  total_timesteps: 20000000
+  total_timesteps: 4096
   log_interval: 1
-  log_every: 200000
+  log_every: 512
 
 hrl:
-  goal_every: 6
+  goal_every: 4
   goal_dim: 3
 
 manager:
   learning_rate: 0.0003
-  n_steps: 256
-  batch_size: 64
+  n_steps: 64
+  batch_size: 32
   n_epochs: 4
   gamma: 0.99
   gae_lambda: 0.95
   clip_range: 0.2
   ent_coef: 0.01
   vf_coef: 0.5
-  net_arch: [128, 128]
+  net_arch: [64, 64]
 
 worker:
   learning_rate: 0.001
-  buffer_size: 1000000
-  learning_starts: 4096
-  batch_size: 256
+  buffer_size: 10000
+  learning_starts: 512
+  batch_size: 128
   tau: 0.005
   gamma: 0.99
   train_freq: 1
   gradient_steps: 1
   ent_coef: 0.2
-  net_arch: [256, 256]
+  net_arch: [128, 128]

@@ -129,6 +129,56 @@ def test_metrics_accepts_collateral_return_series():
     assert m["final_equity"] == pytest.approx(1003.0)  # dollar facts stay on equity
 
 
+def test_metrics_daily_resample_matches_hand_computed():
+    from report import metrics
+
+    # 8 days of 288 5-min bars each; a genuinely smooth daily climb.
+    bars_per_day = 288
+    n_days = 8
+    daily = np.linspace(1000.0, 1180.0, n_days + 1)  # equity at each day close
+    net = np.repeat(np.repeat(daily, bars_per_day), 1)
+    # rebuild a net curve that marks equity once per day (flat intra-day),
+    # matching how the realized book steps.
+    net = np.concatenate(
+        [np.full(bars_per_day, daily[i]) for i in range(n_days)] + [np.array([daily[-1]])]
+    )
+    rf = 0.045
+    m = metrics(net, periods_per_year=72576.0, freq="daily", rf_annual=rf)
+    day_rets = (daily[1:] / daily[:-1]) - 1.0
+    excess = day_rets - rf / 252.0
+    assert m["freq"] == "daily"
+    assert m["sharpe"] == pytest.approx(
+        excess.mean() / (excess.std() + 1e-12) * np.sqrt(252.0), rel=1e-9
+    )
+    assert m["rf_annual"] == pytest.approx(rf)
+
+
+def test_metrics_sortino_none_when_no_downside():
+    from report import metrics
+
+    net = np.array([1000.0, 1010.0, 1025.0, 1045.0, 1070.0])  # monotone
+    m = metrics(net, periods_per_year=252.0, rf_annual=0.045, freq="daily")
+    assert "sharpe" in m
+    assert m["sortino"] is None
+
+
+def test_metrics_rf_lowers_per_bar_mean():
+    from report import metrics
+
+    net = np.array([1000.0, 1001.0, 1000.5, 1002.0, 1001.0, 1003.0])
+    m0 = metrics(net, periods_per_year=72576.0)
+    m1 = metrics(net, periods_per_year=72576.0, rf_annual=0.045)
+    assert m1["sharpe"] < m0["sharpe"]  # rf drag on excess return
+
+
+def test_trade_stats_profit_factor_none_without_losses():
+    from report import _trade_stats
+
+    st = _trade_stats([{"realized_pnl": 5.0}, {"realized_pnl": 7.0}])
+    assert st["pf"] is None
+    assert st["win_rate"] == pytest.approx(100.0)
+
+
 def test_figure1_renders_with_per_symbol_and_episode_overlays(tmp_path):
     from report import figure1
 
