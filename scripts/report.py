@@ -1070,13 +1070,6 @@ def figure1(result, path, theme="synthwave", overlays=True, ret_series=None):
     c = _palette(theme)
     net, gross = np.asarray(result["net"]), np.asarray(result["gross"])
     steps = np.asarray(result["steps"])
-    if ret_series is not None and np.asarray(ret_series).size:
-        rets = np.asarray(ret_series)
-    else:
-        rets = _returns(net)
-    rets = rets[: max(len(steps) - 1, 1)]
-    if rets.size == 0:
-        rets = np.zeros(1)
     peak = np.maximum.accumulate(net)
     dd = (net - peak) / np.maximum(peak, 1e-8)
     max_dd = float(dd.min())
@@ -1120,39 +1113,51 @@ def figure1(result, path, theme="synthwave", overlays=True, ret_series=None):
     fig.add_trace(go.Scatter(x=steps, y=gross, mode="lines", line=dict(color=c["lime"], width=1.8, dash="dot"), name="Gross"), 1, 1)
     fig.add_hline(y=float(net[0]), line=dict(color=c["muted"], width=1, dash="dash"), row=1, col=1)
 
-    win = rets >= 0
+    # True per-trade returns: realized_pnl / collateral at the trade's close
+    # bar. The aggregated bar ROC is diluted across episodes at aligned bar
+    # indices, so a -100% liquidation never surfaces in it; plotting the
+    # ledger's own returns preserves the full picture (liq = -1.0 exactly).
+    xs = np.array([float(t.get("closed_at", 0.0) or 0.0) for t in result["ledger"]], dtype=float)
+    coll = np.array([float(t.get("collateral", 0.0) or 0.0) for t in result["ledger"]], dtype=float)
+    ys = np.where(coll > 1e-9, np.array([float(t.get("realized_pnl", 0.0) or 0.0) for t in result["ledger"]])
+                  / np.maximum(coll, 1e-9), 0.0)
+    liq = np.array([t.get("exit_type") == "liquidation" for t in result["ledger"]])
+    trade_rets = ys  # full-resolution per-trade returns for the histogram
     # Rendering is O(trades): with ~100k+ closes (large episodes / stochastic
     # rollouts) a marker per trade becomes the dominant report cost. Downsample
     # to a fixed cap while keeping the true counts in the title.
     _MAX_TRADE_MARKERS = 12_000
-    if rets.size > _MAX_TRADE_MARKERS:
+    if ys.size > _MAX_TRADE_MARKERS:
         _cap = _MAX_TRADE_MARKERS
-        idx = np.linspace(0, rets.size - 1, _cap).round().astype(int)
+        idx = np.linspace(0, ys.size - 1, _cap).round().astype(int)
         idx = np.unique(idx)
-        sub_steps, sub_rets = steps[1:][idx], rets[idx]
-        win = sub_rets >= 0
-        fig.add_trace(go.Scatter(x=sub_steps[win], y=sub_rets[win], mode="markers",
-                                 marker=dict(size=7, color=c["cyan"], opacity=0.75, line=dict(width=0)), name="Win"), 1, 2)
-        fig.add_trace(go.Scatter(x=sub_steps[~win], y=sub_rets[~win], mode="markers",
-                                 marker=dict(size=7, color=c["magenta"], opacity=0.75, line=dict(width=0)), name="Loss"), 1, 2)
+        xs, ys, liq, coll = xs[idx], ys[idx], liq[idx], coll[idx]
+        sub_rets = ys
     else:
-        fig.add_trace(go.Scatter(x=steps[1:][win], y=rets[win], mode="markers",
-                                 marker=dict(size=7, color=c["cyan"], opacity=0.75, line=dict(width=0)), name="Win"), 1, 2)
-        fig.add_trace(go.Scatter(x=steps[1:][~win], y=rets[~win], mode="markers",
-                                 marker=dict(size=7, color=c["magenta"], opacity=0.75, line=dict(width=0)), name="Loss"), 1, 2)
+        sub_rets = ys
+    win = sub_rets > 0
+    loss = sub_rets <= 0
+    fig.add_trace(go.Scatter(x=xs[win], y=sub_rets[win], mode="markers",
+                             marker=dict(size=7, color=c["magenta"], opacity=0.75, line=dict(width=0)), name="Win"), 1, 2)
+    fig.add_trace(go.Scatter(x=xs[loss & ~liq], y=sub_rets[loss & ~liq], mode="markers",
+                             marker=dict(size=7, color=c["cyan"], opacity=0.75, line=dict(width=0)), name="Loss"), 1, 2)
+    fig.add_trace(go.Scatter(x=xs[liq], y=sub_rets[liq], mode="markers",
+                             marker=dict(size=9, symbol="x", color=c["cyan"], opacity=0.9,
+                                         line=dict(width=0)), name="Liquidation"), 1, 2)
     fig.add_hline(y=0, line=dict(color=c["spine"], width=1), row=1, col=2)
+    fig.add_hline(y=-1.0, line=dict(color="#FF4D6D", width=1, dash="dash"), row=1, col=2)
 
     fig.add_trace(go.Scatter(x=steps, y=dd, mode="lines", fill="tozeroy", fillcolor=c["magenta_soft"],
                              line=dict(color=c["magenta"], width=2.4), name="Drawdown", showlegend=False), 2, 1)
-    fig.add_trace(go.Histogram(x=rets, nbinsx=36, marker=dict(color=c["cyan"], line=dict(color=c["bg"], width=0.6), opacity=0.9),
+    fig.add_trace(go.Histogram(x=trade_rets, nbinsx=36, marker=dict(color=c["cyan"], line=dict(color=c["bg"], width=0.6), opacity=0.9),
                                showlegend=False), 2, 2)
     fig.add_vline(x=0, line=dict(color=c["muted"], width=1, dash="dash"), row=2, col=2)
-    fig.add_vline(x=float(np.mean(rets)), line=dict(color=c["lime"], width=1.8), row=2, col=2)
+    fig.add_vline(x=float(np.mean(trade_rets)), line=dict(color=c["lime"], width=1.8), row=2, col=2)
 
     fig.update_layout(**_base_layout(c, title=dict(
         text=(f"Equity & risk<br><sup style='color:{c['muted']}'>"
               f"Net {net_ret:+.1%} · gross {gross_ret:+.1%} · costs {fees:,.0f} · max DD {max_dd:.1%} · {n_close} closes"
-              f"{' · markers sampled @ ' + str(_MAX_TRADE_MARKERS) if rets.size > _MAX_TRADE_MARKERS else ''}</sup>"),
+              f"{' · markers sampled @ ' + str(_MAX_TRADE_MARKERS) if ys.size > _MAX_TRADE_MARKERS else ''}</sup>"),
         x=0.01, xanchor="left"),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, x=1, xanchor="right"),
         margin=dict(l=60, r=32, t=72, b=88)))

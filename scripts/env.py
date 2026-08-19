@@ -338,40 +338,6 @@ class TradingEnv:
             exit_hit = mx.zeros((num_envs,), dtype=mx.bool_)
             sl_enabled = self.use_stop_loss and stop_loss > 0.0
             tp_enabled = self.use_take_profit and take_profit > 0.0
-            if sl_enabled or tp_enabled:
-                long = q > EPS
-                short = q < -EPS
-                sl_px = mx.where(long, entry * (1.0 - stop_loss), entry * (1.0 + stop_loss))
-                tp_px = mx.where(long, entry * (1.0 + take_profit), entry * (1.0 - take_profit))
-                sl_touch = mx.zeros((num_envs,), dtype=mx.bool_)
-                tp_touch = mx.zeros((num_envs,), dtype=mx.bool_)
-                if sl_enabled:
-                    sl_touch = (long & (low <= entry * (1.0 - stop_loss))) | (
-                        short & (high >= entry * (1.0 + stop_loss))
-                    )
-                if tp_enabled:
-                    tp_touch = (long & (high >= entry * (1.0 + take_profit))) | (
-                        short & (low <= entry * (1.0 - take_profit))
-                    )
-                sl_hit = sl_touch
-                tp_hit = tp_touch & ~sl_touch
-                exit_hit = sl_touch | tp_touch
-                fill_exit = mx.where(sl_hit, sl_px, mx.where(tp_hit, tp_px, price))
-                if self.margin_mode == "cross":
-                    balance = mx.where(
-                        exit_hit,
-                        balance + q * (fill_exit - entry) - close_fee * mx.abs(q) * fill_exit,
-                        balance,
-                    )
-                else:
-                    balance = mx.where(
-                        exit_hit,
-                        balance + collateral + q * (fill_exit - entry) - close_fee * mx.abs(q) * fill_exit,
-                        balance,
-                    )
-                q = mx.where(exit_hit, 0.0, q)
-                entry = mx.where(exit_hit, 0.0, entry)
-                collateral = mx.where(exit_hit, 0.0, collateral)
 
             # Dynamic liquidation threshold (isolated margin): liquidate once
             # the position has lost ``thr`` of its collateral (the PERP loss,
@@ -384,27 +350,62 @@ class TradingEnv:
                 thr_base + thr_slope_hi * (lev_open - thr_ref),
             )
             thr = mx.clip(thr, thr_floor, 1.0)
-            if self.margin_mode == "cross":
-                liq = (mx.abs(q) > EPS) & ((balance + q * (price - entry)) <= (1.0 - thr) * collateral)
-                balance = mx.where(
-                    liq,
-                    mx.maximum(balance - collateral - liq_fee * notional, 0.0),
-                    balance,
+            # ``thr`` is a fraction of collateral lost; convert it to a price
+            # move so it is comparable to the stop-loss (a fraction of price):
+            # how far the price can move against the position before liq.
+            liq_price_dist = thr / mx.maximum(lev_open, EPS)
+            # Guard: the stop-loss can never be looser than liquidation, so on
+            # the way down the path always touches SL first (or exactly at the
+            # same point), never after the liq engine.
+            effective_sl = mx.minimum(stop_loss, liq_price_dist)
+
+            long = q > EPS
+            short = q < -EPS
+            sl_px = mx.where(long, entry * (1.0 - effective_sl), entry * (1.0 + effective_sl))
+            liq_px = mx.where(long, entry * (1.0 - liq_price_dist), entry * (1.0 + liq_price_dist))
+            tp_px = mx.where(long, entry * (1.0 + take_profit), entry * (1.0 - take_profit))
+            sl_touch = mx.zeros((num_envs,), dtype=mx.bool_)
+            tp_touch = mx.zeros((num_envs,), dtype=mx.bool_)
+            if sl_enabled:
+                sl_touch = (long & (low <= sl_px)) | (
+                    short & (high >= sl_px)
                 )
+            if tp_enabled:
+                tp_touch = (long & (high >= tp_px)) | (
+                    short & (low <= tp_px)
+                )
+            # Bar-extreme liquidation touch (same pattern as SL/TP): the low TF
+            # is 1m/5m/15m, not 1s, so assume the level was hit if the bar's
+            # high/low crosses it — even if the bar closes back through.
+            liq_touch = (long & (low <= liq_px)) | (short & (high >= liq_px))
+            # Pessimistic intra-bar priority: SL first, then liq, then TP — the
+            # path to the liq level passes through the (clamped) SL first, and
+            # TP is only credited if neither adverse level was tagged.
+            sl_hit = sl_touch
+            liq = liq_touch & ~sl_touch
+            tp_hit = tp_touch & ~sl_touch & ~liq_touch
+            exit_hit = sl_touch | liq_touch | tp_touch
+            fill_exit = mx.where(sl_touch, sl_px, mx.where(liq_touch, liq_px, tp_px))
+            if self.margin_mode == "cross":
+                bal_close = balance + q * (fill_exit - entry) - close_fee * mx.abs(q) * fill_exit
+                # Liquidation: whole-account equity backs the position, so the
+                # allocated collateral and the liq fee come out of the balance.
+                bal_liq = mx.maximum(balance - collateral - liq_fee * notional, 0.0)
             else:
-                liq = (mx.abs(q) > EPS) & ((collateral + q * (price - entry)) <= (1.0 - thr) * collateral)
+                bal_close = balance + collateral + q * (fill_exit - entry) - close_fee * mx.abs(q) * fill_exit
                 # Full collateral loss on liquidation: the locked margin is
                 # forfeited (never returned to cash). The liquidation fee is
                 # charged on top of the forfeit, floored at zero so isolated
                 # bankruptcy truncation keeps the account non-negative.
-                balance = mx.where(
-                    liq,
-                    mx.maximum(balance - liq_fee * notional, 0.0),
-                    balance,
-                )
-            q = mx.where(liq, 0.0, q)
-            entry = mx.where(liq, 0.0, entry)
-            collateral = mx.where(liq, 0.0, collateral)
+                bal_liq = mx.maximum(balance - liq_fee * notional, 0.0)
+            balance = mx.where(
+                sl_touch, bal_close,
+                mx.where(liq_touch, bal_liq,
+                         mx.where(tp_touch, bal_close, balance)),
+            )
+            q = mx.where(exit_hit, 0.0, q)
+            entry = mx.where(exit_hit, 0.0, entry)
+            collateral = mx.where(exit_hit, 0.0, collateral)
 
             if discrete:
                 a = action.astype(mx.float32)
