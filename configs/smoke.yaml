@@ -62,6 +62,15 @@ returns:
 eval:
   episodes: 2
   max_positions_per_symbol: 1
+  deterministic: true
+  adaptive_knob:
+    active: on
+    window_days: 3
+    occupancy_target: 0.15
+    tolerance: 0.02
+    p_gain: 1.5
+    min_mult: 0.01
+    max_mult: 100.0
 
 train:
   total_timesteps: 4096

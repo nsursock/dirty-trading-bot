@@ -14,6 +14,7 @@ cumsum / rolling ops over ``(n_symbols, n_steps)``.
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 
 import mlx.core as mx
@@ -254,7 +255,9 @@ def generate(
     )
 
     arrays = {k: [] for k in ("opens", "highs", "lows", "closes", "vols")}
+    t_gen = time.monotonic()
     for i, name in enumerate(tqdm(names, desc="symbols", leave=False)):
+        t0 = time.monotonic()
         mu, sigma, s0 = params[name]
         log.debug("data: symbol=%s mu=%.4f sigma=%.4f s0=%.4f", name, mu, sigma, s0)
         ds = Generator(GBM(mu=mu, sigma=sigma, s0=s0, dt=dt), seed=seed).sample(
@@ -266,6 +269,10 @@ def generate(
         arrays["lows"].append(o.lows)
         arrays["closes"].append(o.closes)
         arrays["vols"].append(o.vols)
+        log.debug("data: symbol=%s GBM+OHLCV in %.2fs", name, time.monotonic() - t0)
+
+    log.info("data: %d symbols x %d low-TF steps generated in %.2fs",
+             len(names), n_steps, time.monotonic() - t_gen)
 
     ohlcv = OHLCV(
         opens=mx.concatenate(arrays["opens"], axis=0),

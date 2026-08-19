@@ -14,6 +14,7 @@ import csv
 import logging
 import math
 import random
+import time
 from collections import Counter
 from pathlib import Path
 
@@ -69,6 +70,9 @@ def _test_env(cfg, seed_offset=1):
     e["return_basis"] = dict(cfg.get("returns", {})).get("basis", "account")
     e["goal_dim"] = h.get("goal_dim", 3)
     e["action_space"] = "continuous"
+    ak = ev.get("adaptive_knob")
+    if ak:
+        e["adaptive_knob"] = ak
     symbols = dict(list(SYMBOLS.items())[: d.get("n_symbols", 4)])
     seed = cfg.get("seed", 42) + seed_offset
     bundle = generate(
@@ -79,6 +83,9 @@ def _test_env(cfg, seed_offset=1):
         high_tf=tf.get("high", 240),
         regime=d.get("regime", "bull"),
     )
+    log.info("test seed+%d: GBM bundle generated (n_steps=%d, n_resample=%d, low=%s high=%s)",
+             seed_offset, bundle.features.shape[1], bundle.n_resample,
+             tf.get("low", 5), tf.get("high", 240))
     env = TradingEnv(bundle.features, bundle.ohlcv.closes,
                      highs=bundle.ohlcv.highs, lows=bundle.ohlcv.lows, seed=seed, **e)
     return bundle, env, list(bundle.symbols), e
@@ -104,8 +111,14 @@ def _mgr_obs_test(high_feats, sym_off_hi, worker_obs, low_steps, T_hi, F, n_resa
     return mgr_obs(high_feats, acct, low_steps, sym_off_hi, T_hi, n_resample)
 
 
-def run_test(cfg, manager, worker, norm_state=None, seed_offset=1, pbar=None) -> dict:
-    """Deterministic joint rollout -> ledger + per-step series.
+def run_test(cfg, manager, worker, norm_state=None, seed_offset=1, pbar=None,
+             deterministic=True) -> dict:
+    """Joint rollout -> ledger + per-step series.
+
+    ``deterministic=True`` drives both tiers greedily (identical, reproducible
+    test runs); ``deterministic=False`` samples manager goals and worker
+    actions from the trained policies, so each run exercises the full action
+    distribution at the cost of run-to-run variance.
 
     ``seed_offset`` selects the GBM bundle draw: the locked final test uses
     ``TEST_SEED_OFFSETS``; validation uses ``VALID_SEED_OFFSETS``. When a
@@ -116,7 +129,11 @@ def run_test(cfg, manager, worker, norm_state=None, seed_offset=1, pbar=None) ->
     import mlx.core as mx
     from dirty_mlx_ml.reinforcement import VecNormalize
 
+    t_env = time.monotonic()
     bundle, env, symbols, e = _test_env(cfg, seed_offset=seed_offset)
+    log.debug("test seed+%d: bundle+env built in %.2fs (n_steps=%d, S=%d, T_hi=%d, n_resample=%d)",
+              seed_offset, time.monotonic() - t_env, bundle.features.shape[1], env.n_symbols,
+              bundle.high_features.shape[1], bundle.n_resample)
     if norm_state is not None:
         env = VecNormalize(env, norm_obs=True, norm_reward=True,
                            clip_obs=10.0, clip_reward=10.0, gamma=0.99)
@@ -180,13 +197,19 @@ def run_test(cfg, manager, worker, norm_state=None, seed_offset=1, pbar=None) ->
                     colour="magenta", leave=False)
     else:
         pbar.set_description(f"test seed+{seed_offset}")
+    t_roll = time.monotonic()
+    _TICK = max(T // 10, 1)
     while t < T - 1:
-        goal, _, _ = manager.policy.get_action(mgr_obs, deterministic=True)
+        if t % _TICK == 0 and t > 0:
+            el = time.monotonic() - t_roll
+            log.debug("test seed+%d: %d/%d steps (%.0f steps/s, %.1fs elapsed)",
+                      seed_offset, t, T - 1, t / max(el, 1e-9), el)
+        goal, _ = manager.predict(mgr_obs, deterministic=deterministic)
         env.set_goal(_one_hot(goal, goal_dim))
         for _k in range(goal_every):
             if t >= T - 1:
                 break
-            act = worker._scale_action(worker.actor.sample(worker_obs, deterministic=True)[0])
+            act, _ = worker.predict(worker_obs, deterministic=deterministic)
             worker_obs, r, done, info = env.step(act)
             t += 1
             states_buf.append(env._state)
@@ -201,9 +224,12 @@ def run_test(cfg, manager, worker, norm_state=None, seed_offset=1, pbar=None) ->
     if own_pbar:
         pbar.update(pbar.total - pbar.n)
         pbar.close()
+    log.debug("test seed+%d: rollout done in %.2fs (T=%d, %.0f steps/s)",
+              seed_offset, time.monotonic() - t_roll, T - 1, (T - 1) / max(time.monotonic() - t_roll, 1e-9))
 
     # Materialize the buffered rollout in one shot, then reconstruct the ledger
     # in numpy.
+    t_ledger = time.monotonic()
     states_np = np.asarray(mx.stack(states_buf))
     acts_np = np.asarray(mx.stack(acts_buf)).reshape(len(acts_buf), -1)
     steps_np = np.asarray(mx.stack(steps_buf))
@@ -324,6 +350,8 @@ def run_test(cfg, manager, worker, norm_state=None, seed_offset=1, pbar=None) ->
         gross_curve.append(float(np.mean(book + fees_paid + fund_paid)))
 
     log.debug("test rollout done: steps=%d trades=%d final_equity=%.4f", t, len(ledger), net_curve[-1])
+    log.debug("test seed+%d: ledger/reconstruction phase %.2fs this episode", seed_offset,
+              time.monotonic() - t_ledger)
     sym_by_env = np.asarray(sym_idx)
 
     # Ledger-driven per-symbol equity (realized) and collateral-basis ROC.
@@ -449,7 +477,7 @@ def metrics(net, periods_per_year=252, rets=None, basis="account"):
     }
 
 
-def validate(cfg, manager, worker, n_seeds=2, norm_state=None) -> dict:
+def validate(cfg, manager, worker, n_seeds=2, norm_state=None, deterministic=True) -> dict:
     """Score a trained model on the held-out *validation* bundle.
 
     Runs ``run_test`` on ``n_seeds`` validation seed offsets (never the locked
@@ -460,7 +488,8 @@ def validate(cfg, manager, worker, n_seeds=2, norm_state=None) -> dict:
     ppy = _periods_per_year(cfg)
     nets, sharpes = [], []
     for off in VALID_SEED_OFFSETS[:n_seeds]:
-        r = run_test(cfg, manager, worker, norm_state=norm_state, seed_offset=off)
+        r = run_test(cfg, manager, worker, norm_state=norm_state, seed_offset=off,
+                     deterministic=deterministic)
         m = metrics(r["net"], periods_per_year=ppy)
         nets.append(np.asarray(r["net"]))
         sharpes.append(float(m.get("sharpe", 0.0)))
@@ -840,11 +869,15 @@ def breakdown(result, path, cfg=None, rets=None, basis="account"):
     by_margin = _bucket(ledger, lambda t: ("pool (cross)" if margin_mode == "cross" else "loner (isolated)"),
                         ["loner (isolated)", "pool (cross)"])
 
-    def _vintage(t):
-        i = ledger.index(t)
+    def _vintage(i):
         frac = i / n
         return "opening act (first 20%)" if frac < 0.2 else "encore (last 20%)" if frac >= 0.8 else "mid-set (20-80%)"
-    by_vintage = _bucket(ledger, _vintage, ["opening act (first 20%)", "mid-set (20-80%)", "encore (last 20%)"])
+    _vgroups = {}
+    for _i, _t in enumerate(ledger):
+        _vgroups.setdefault(_vintage(_i), []).append(_t)
+    by_vintage = [(lab, _trade_stats(_vgroups[lab], base=base))
+                  for lab in ("opening act (first 20%)", "mid-set (20-80%)", "encore (last 20%)")
+                  if lab in _vgroups]
 
     lines: list[str] = ["BREAKDOWN", "=========", ""]
     if cfg is not None:
@@ -1088,10 +1121,25 @@ def figure1(result, path, theme="synthwave", overlays=True, ret_series=None):
     fig.add_hline(y=float(net[0]), line=dict(color=c["muted"], width=1, dash="dash"), row=1, col=1)
 
     win = rets >= 0
-    fig.add_trace(go.Scatter(x=steps[1:][win], y=rets[win], mode="markers",
-                             marker=dict(size=7, color=c["cyan"], opacity=0.75, line=dict(width=0)), name="Win"), 1, 2)
-    fig.add_trace(go.Scatter(x=steps[1:][~win], y=rets[~win], mode="markers",
-                             marker=dict(size=7, color=c["magenta"], opacity=0.75, line=dict(width=0)), name="Loss"), 1, 2)
+    # Rendering is O(trades): with ~100k+ closes (large episodes / stochastic
+    # rollouts) a marker per trade becomes the dominant report cost. Downsample
+    # to a fixed cap while keeping the true counts in the title.
+    _MAX_TRADE_MARKERS = 12_000
+    if rets.size > _MAX_TRADE_MARKERS:
+        _cap = _MAX_TRADE_MARKERS
+        idx = np.linspace(0, rets.size - 1, _cap).round().astype(int)
+        idx = np.unique(idx)
+        sub_steps, sub_rets = steps[1:][idx], rets[idx]
+        win = sub_rets >= 0
+        fig.add_trace(go.Scatter(x=sub_steps[win], y=sub_rets[win], mode="markers",
+                                 marker=dict(size=7, color=c["cyan"], opacity=0.75, line=dict(width=0)), name="Win"), 1, 2)
+        fig.add_trace(go.Scatter(x=sub_steps[~win], y=sub_rets[~win], mode="markers",
+                                 marker=dict(size=7, color=c["magenta"], opacity=0.75, line=dict(width=0)), name="Loss"), 1, 2)
+    else:
+        fig.add_trace(go.Scatter(x=steps[1:][win], y=rets[win], mode="markers",
+                                 marker=dict(size=7, color=c["cyan"], opacity=0.75, line=dict(width=0)), name="Win"), 1, 2)
+        fig.add_trace(go.Scatter(x=steps[1:][~win], y=rets[~win], mode="markers",
+                                 marker=dict(size=7, color=c["magenta"], opacity=0.75, line=dict(width=0)), name="Loss"), 1, 2)
     fig.add_hline(y=0, line=dict(color=c["spine"], width=1), row=1, col=2)
 
     fig.add_trace(go.Scatter(x=steps, y=dd, mode="lines", fill="tozeroy", fillcolor=c["magenta_soft"],
@@ -1103,7 +1151,8 @@ def figure1(result, path, theme="synthwave", overlays=True, ret_series=None):
 
     fig.update_layout(**_base_layout(c, title=dict(
         text=(f"Equity & risk<br><sup style='color:{c['muted']}'>"
-              f"Net {net_ret:+.1%} · gross {gross_ret:+.1%} · costs {fees:,.0f} · max DD {max_dd:.1%} · {n_close} closes</sup>"),
+              f"Net {net_ret:+.1%} · gross {gross_ret:+.1%} · costs {fees:,.0f} · max DD {max_dd:.1%} · {n_close} closes"
+              f"{' · markers sampled @ ' + str(_MAX_TRADE_MARKERS) if rets.size > _MAX_TRADE_MARKERS else ''}</sup>"),
         x=0.01, xanchor="left"),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, x=1, xanchor="right"),
         margin=dict(l=60, r=32, t=72, b=88)))
@@ -1380,27 +1429,34 @@ def _aggregate_episodes(episodes):
     }
 
 
-def generate_report(cfg, manager, worker, out_dir, norm_state=None):
+def generate_report(cfg, manager, worker, out_dir, norm_state=None, deterministic=None):
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     theme = resolve_theme((cfg.get("report") or {}).get("theme", "synthwave"))
     overlays = bool((cfg.get("report") or {}).get("overlays", True))
     ep_figs = bool((cfg.get("report") or {}).get("episode_figures", False))
     ret_basis = (cfg.get("returns") or {}).get("basis", "account")
+    if deterministic is None:
+        deterministic = bool((cfg.get("eval") or {}).get("deterministic", True))
     offsets = _episode_offsets(cfg)
-    log.info("report: %d test episodes (seed offsets %s, theme=%s, overlays=%s, episode_figures=%s, returns=%s)",
-             len(offsets), offsets, theme, overlays, ep_figs, ret_basis)
+    log.info("report: %d test episodes (seed offsets %s, theme=%s, overlays=%s, episode_figures=%s, returns=%s, deterministic=%s)",
+             len(offsets), offsets, theme, overlays, ep_figs, ret_basis, deterministic)
 
     episodes = []
     per_ep_steps = max(int((cfg.get("data") or {}).get("n_steps", 400)) - 1, 1)
     pbar = tqdm(total=len(offsets) * per_ep_steps, desc="test phase",
                 unit="step", colour="magenta", leave=True)
     for ep, off in enumerate(offsets):
-        raw = run_test(cfg, manager, worker, norm_state=norm_state, seed_offset=off, pbar=pbar)
+        t_ep = time.monotonic()
+        raw = run_test(cfg, manager, worker, norm_state=norm_state, seed_offset=off, pbar=pbar,
+                       deterministic=deterministic)
         for t in raw["ledger"]:
             t["episode"] = ep
             t["seed_offset"] = off
         episodes.append(raw)
+        log.info("report: episode %d/%d (seed%d) done in %.2fs: %d trades, eq=%.4f",
+                 ep + 1, len(offsets), off, time.monotonic() - t_ep,
+                 len(raw["ledger"]), float(np.asarray(raw["net"])[-1]))
         # Each episode builds a fresh GBM bundle + features on the Metal device;
         # release the MLX allocator cache between draws so long test phases do
         # not exhaust the Metal heap. ``raw`` holds only numpy arrays, so no
@@ -1417,10 +1473,17 @@ def generate_report(cfg, manager, worker, out_dir, norm_state=None):
     rets = None
     if ret_basis == "collateral" and np.asarray(result.get("roc")).size > 1:
         rets = np.asarray(result["roc"])[1:]
+    t_figs = time.monotonic()
     write_ledger(result["ledger"], out_dir / "trades.csv")
+    log.debug("report: trades.csv written in %.2fs (%d rows)",
+              time.monotonic() - t_figs, len(result["ledger"]))
     breakdown(result, out_dir / "breakdown.txt", cfg, rets=rets, basis=ret_basis)
+    log.debug("report: breakdown.txt written in %.2fs", time.monotonic() - t_figs)
     figure1(result, out_dir / "figure1.png", theme=theme, overlays=overlays, ret_series=rets)
+    log.debug("report: figure1.png written in %.2fs", time.monotonic() - t_figs)
     figure2(result, out_dir / "figure2.png", theme=theme)
+    log.debug("report: figure2.png written in %.2fs", time.monotonic() - t_figs)
+    n_ep_figs = 0
     if ep_figs:
         for raw in episodes:
             per_ep = {
@@ -1437,6 +1500,9 @@ def generate_report(cfg, manager, worker, out_dir, norm_state=None):
             figure1(per_ep, out_dir / f"figure1_episode_{raw['seed_offset']}.png", theme=theme,
                     overlays=overlays, ret_series=ep_rets)
             figure2(per_ep, out_dir / f"figure2_episode_{raw['seed_offset']}.png", theme=theme)
+            n_ep_figs += 2
+    log.debug("report: %d episode figures written; figure phase %.2fs total",
+              n_ep_figs, time.monotonic() - t_figs)
     log.debug("report artifacts -> %s", out_dir)
     agg_net = result["net"]
     m = metrics(agg_net, periods_per_year=_periods_per_year(cfg), rets=rets, basis=ret_basis)

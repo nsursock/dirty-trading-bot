@@ -68,6 +68,7 @@ class TradingEnv:
         size_fraction: float = 1.0,
         side_threshold: float = 0.2,
         trade_knob: float = 1.0,
+        adaptive_knob: dict | None = None,
         reward_mode: str = "smoke",
         drawdown_penalty: float = 1.0,
         reward_clip: float = 10.0,
@@ -124,6 +125,39 @@ class TradingEnv:
         self.size_fraction = float(size_fraction)
         self.side_threshold = float(side_threshold)
         self.trade_knob = max(float(trade_knob), 1e-3)
+        self.adaptive_knob = adaptive_knob or {}
+        ak = self.adaptive_knob
+        bpd = max(int(bars_per_day), 1)
+        n_env = max(self.num_envs, 1)
+        # Explicit on/off switch. Accepts "on"/"off" (also yes/no, true/false,
+        # 1/0). When absent, falls back to the legacy heuristic (a positive
+        # window implies enabled).
+        active = str(ak.get("active", "")).strip().lower()
+        if active:
+            self.ak_enabled = active in ("on", "yes", "true", "1")
+        else:
+            self.ak_enabled = int(ak.get("window_days", 0)) > 0 or int(ak.get("window", 0)) > 0
+        # Window measured in DAYS (cadence-invariant), converted to bars.
+        # A 1-hour window on scalp vs 3 days on swing would make the
+        # trailing rate incomparable; window_days normalizes it.
+        self.ak_window = max(int(ak.get("window_days", ak.get("window_bars", 1.0 * bpd)) * bpd), bpd)
+        # Portfolio-wide occupancy target: fraction of (symbol x bar) cells
+        # that spend time IN a position, across ALL symbols combined. Bounded
+        # [0,1] so it is a clean invariant across the 288:96:6 bar ratio
+        # (unlike trades/day, which swing could never reach). The market
+        # decides which symbols hold; the knob throttles total exposure.
+        self.ak_target = float(ak.get("occupancy_target", 0.15))
+        # Deadband (+/- occupancy fraction, portfolio): within tolerance the
+        # knob stays put, so minor noise never churns the threshold.
+        self.ak_tol = float(ak.get("tolerance", 0.02))
+        # Proportional controller: mult = 1 - gain * err/target (normalized,
+        # in occupancy units). gain around 1-2 gives ~full correction per
+        # window. Wide clamp because natural exposure differs by ~10x across
+        # configs and the controller must be able to close that gap.
+        self.ak_gain = float(ak.get("p_gain", 1.0))
+        self.ak_min = float(ak.get("min_mult", 0.01))
+        self.ak_max = float(ak.get("max_mult", 100.0))
+        self._open_hist = mx.zeros((self.num_envs, self.ak_window), dtype=mx.float32)
         self.reward_mode = reward_mode
         self.drawdown_penalty = float(drawdown_penalty)
         self.reward_clip = float(reward_clip)
@@ -214,6 +248,8 @@ class TradingEnv:
         self._state = self._initial_state()
         self._steps = mx.zeros((self.num_envs,), dtype=mx.int32)
         self._prev_done = mx.zeros((self.num_envs,), dtype=mx.bool_)
+        if self.ak_enabled:
+            self._open_hist = mx.zeros_like(self._open_hist)
         return self._obs(self._state, self._steps), {}
 
     def _build_step(self):
@@ -249,6 +285,13 @@ class TradingEnv:
         size_frac = self.size_fraction
         side_thr = self.side_threshold
         trade_knob = self.trade_knob
+        ak_enabled = self.ak_enabled
+        ak_window = self.ak_window
+        ak_target = self.ak_target
+        ak_tol = self.ak_tol
+        ak_gain = self.ak_gain
+        ak_min = self.ak_min
+        ak_max = self.ak_max
         reward_mode = self.reward_mode
         dd_penalty = self.drawdown_penalty
         reward_clip = self.reward_clip
@@ -269,7 +312,7 @@ class TradingEnv:
         )
         mx.eval(obs_static0, reset_acct)
 
-        def step(state, steps, prev_done, key, action, price_prev, price, high, low, feats):
+        def step(state, steps, prev_done, key, action, price_prev, price, high, low, feats, open_hist):
             mask = prev_done
             t = mx.where(mask, mx.zeros_like(steps), steps)
             t_next = t + 1
@@ -369,7 +412,21 @@ class TradingEnv:
                 t = mx.full((num_envs,), size_frac)
             else:
                 a = mx.clip(mx.reshape(action.astype(mx.float32), (num_envs,)), -1.0, 1.0)
-                eff_thr = side_thr / trade_knob
+                if ak_enabled:
+                    # Portfolio-wide occupancy homeostat: fraction of
+                    # (symbol x bar) cells IN a position across ALL envs in
+                    # the trailing window -> one shared knob for every env.
+                    # The market picks which symbols hold; the knob throttles
+                    # total exposure toward the occupancy target.
+                    occupied = open_hist.sum()
+                    occ = occupied / (ak_window * num_envs)
+                    err = occ - ak_target
+                    err_dead = mx.where(mx.abs(err) > ak_tol, err - mx.sign(err) * ak_tol, 0.0)
+                    mult = mx.clip(1.0 - ak_gain * err_dead / ak_target, ak_min, ak_max)
+                    knob_eff = trade_knob * mult
+                else:
+                    knob_eff = trade_knob
+                eff_thr = side_thr / knob_eff
                 side = mx.where(mx.abs(a) > eff_thr, mx.sign(a), 0.0)
                 t = mx.abs(a)
 
@@ -421,6 +478,11 @@ class TradingEnv:
             collateral = mx.where(open_pos, collateral_new, collateral)
             q = mx.where(open_pos, side * notional_new / (fill + EPS), q)
             entry = mx.where(open_pos, fill, entry)
+
+            if ak_enabled:
+                # Occupancy flag: is this env IN a position at end of bar?
+                in_pos = (mx.abs(q) > EPS).astype(mx.float32)[:, None]
+                open_hist = mx.concatenate([open_hist[:, 1:], in_pos], axis=1)
 
             balance = balance - funding * (q * price)
 
@@ -488,7 +550,10 @@ class TradingEnv:
             exit_flag = mx.where(sl_hit, 2, mx.where(tp_hit, 1, mx.where(liq, 3, 0))).astype(mx.int32)
             exit_flag = mx.where(mask, 0, exit_flag)
 
-            return state2, steps2, done, key, obs, reward, done, truncated, exit_flag
+            if ak_enabled:
+                open_hist = open_hist * (1.0 - m)
+
+            return state2, steps2, done, key, obs, reward, done, truncated, exit_flag, open_hist
 
         t0 = time.time()
         self._step_fn = mx.compile(step)
@@ -508,9 +573,9 @@ class TradingEnv:
             high = mx.take(self.highs_flat, self.sym_off + tn_idx)
             low = mx.take(self.lows_flat, self.sym_off + tn_idx)
         feats = mx.take(self.feats2d, self.sym_off + tn_idx, axis=0)
-        state, steps, prev_done, key, obs, reward, done, truncated, exit_flag = self._step_fn(
+        state, steps, prev_done, key, obs, reward, done, truncated, exit_flag, open_hist = self._step_fn(
             self._state, self._steps, self._prev_done, self._key, action,
-            price_prev, price, high, low, feats,
+            price_prev, price, high, low, feats, self._open_hist,
         )
         self._step_count += 1
         if self._step_count % self.eval_every == 0:
@@ -519,6 +584,7 @@ class TradingEnv:
         self._steps = steps
         self._prev_done = prev_done
         self._key = key
+        self._open_hist = open_hist
         return obs, reward.astype(mx.float32), done, {
             "timeouts": truncated.astype(mx.float32),
             "exit": exit_flag,

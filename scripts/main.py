@@ -6,7 +6,7 @@
     python main.py full   [--config configs/normal.yaml] [--n-envs N] [--timesteps T]
                           [--episodes E] [--theme NAME]
 
-Writes a timestamped run folder ``logs/<timestamp>/`` with a copy of the
+Writes a timestamped run folder ``logs/<timestamp>-<pid>/`` with a copy of the
 source YAML (original filename), ``run.log`` at its root, and ``training/`` /
 ``testing/`` artifacts beneath.
 Screen output is limited to tqdm progress bars.
@@ -23,6 +23,7 @@ import argparse
 import gc
 import json
 import logging
+import os
 import shutil
 from datetime import datetime
 from pathlib import Path
@@ -38,7 +39,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def _run_dir() -> Path:
     ts = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-    d = ROOT / "logs" / ts
+    d = ROOT / "logs" / f"{ts}-{os.getpid()}"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -212,18 +213,18 @@ def _assert_dims_against_manifest(j: JointHRL, ckpt: Path, manifest: dict | None
             )
 
 
-def _test(cfg, run_dir: Path, j: JointHRL) -> dict:
+def _test(cfg, run_dir: Path, j: JointHRL, deterministic=None) -> dict:
     norm_state = j.worker_env.norm_state
     _free_training_memory(j)
     return generate_report(cfg, j.manager, j.worker, run_dir / "testing",
-                           norm_state=norm_state)
+                           norm_state=norm_state, deterministic=deterministic)
 
 
 def _free_training_memory(j: JointHRL) -> None:
     """Release training-side memory before the report phase.
 
-    ``run_test`` only needs ``manager.policy.get_action``,
-    ``worker.actor.sample``/``_scale_action`` and ``norm_state`` — never the
+    ``run_test`` only needs ``manager.predict``/``worker.predict`` and
+    ``norm_state`` — never the
     rollout environments or the SAC replay buffer. In ``full`` mode the trained
     ``JointHRL`` stays alive through the report, holding the 1024-env training
     envs, the replay buffer, and MLX's cached training peak. On a unified-memory
@@ -265,6 +266,8 @@ def main():
                     help="override eval.episodes (test episodes)")
     ap.add_argument("--theme", default=None,
                     help="override report.theme (e.g. synthwave, ghibli, random)")
+    ap.add_argument("--deterministic", action=argparse.BooleanOptionalAction, default=None,
+                    help="sample manager/worker actions (default = config eval.deterministic)")
     args = ap.parse_args()
 
     run_dir = _run_dir()
@@ -288,7 +291,7 @@ def main():
         j = JointHRL(cfg)
         _assert_dims_against_manifest(j, ckpt, manifest, log)
         j.load(ckpt)
-        out = _test(cfg, run_dir, j)
+        out = _test(cfg, run_dir, j, deterministic=args.deterministic)
         log.info("test complete: %s", out["metrics"])
         print(f"done -> {out['out_dir']}  {out['metrics']}")
     elif args.mode == "train":
@@ -297,7 +300,7 @@ def main():
         print(f"trained -> {run_dir / 'training'}")
     else:
         j = _train(cfg, run_dir, log, config_path=src)
-        out = _test(cfg, run_dir, j)
+        out = _test(cfg, run_dir, j, deterministic=args.deterministic)
         log.info("full run complete: %s", out["metrics"])
         print(f"done -> {out['out_dir']}  {out['metrics']}")
 
