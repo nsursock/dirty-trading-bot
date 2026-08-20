@@ -1,4 +1,4 @@
-# dirty-trading-bot
+# Dirty Trading Bot
 
 > Research-phase hierarchical reinforcement learning trading bot for synthetic
 > perpetuals markets on Apple Silicon.
@@ -276,21 +276,31 @@ check is `configs/smoke.yaml`.
 ## Repository Structure
 
 ```text
-configs/           experiment configurations
-roadmap/           research plans and staged roadmap
+configs/               experiment configurations
+roadmap/               research plans and staged roadmap
 scripts/
-  agents.py        PPO manager + SAC worker training loop
-  config.py        YAML loader
-  data.py          synthetic market generation
-  env.py           vectorized perpetuals simulator
-  main.py          train / test / full entry point
-  optim.py         Optuna search on validation bundles
-  report.py        evaluation and reporting glue
-tests/             focused regression tests
+  agents.py            PPO manager + SAC worker training loop
+  config.py            YAML loader
+  data.py              synthetic market generation
+  env.py               vectorized perpetuals simulator
+  main.py              train / test / full entry point
+  optim.py             Optuna search on validation bundles
+  report.py            evaluation and reporting glue
+tests/                 focused regression tests
+  conftest.py          shared pytest fixtures and setup
+  test_ar_gbm.py       AR-vs-GBM data generation checks
+  test_exits.py        stop-loss / take-profit behavior
+  test_margin.py       margin and liquidation coverage
+  test_min_hold.py     minimum holding-period rules
+  test_p0.py           core smoke/regression coverage
+  test_portfolio.py    portfolio-accounting checks
+  test_report_enrich.py report enrichment checks
 utils/
-  bench.py         performance and correctness harness
-  inspect_data.py  synthetic data visualization
-  sweep_ar.py      AR signal-strength sweep runner
+  bench.py             performance and correctness harness
+  calibrate_ar_noise.py AR-noise calibration helper
+  compare_gbm_ar.py    GBM-vs-AR comparison utility
+  inspect_data.py      synthetic data visualization
+  sweep_ar.py          AR signal-strength sweep runner
 ```
 
 ## Key Files
