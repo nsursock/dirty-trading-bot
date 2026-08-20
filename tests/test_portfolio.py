@@ -91,22 +91,6 @@ def test_aggregate_keeps_portfolio_mean_identity():
     assert closes == sorted(closes)
 
 
-def test_breakdown_includes_per_episode_section(tmp_path):
-    from report import _aggregate_episodes, breakdown
-
-    ep1, ep2 = _synthetic_episode(1, seed_off=1), _synthetic_episode(2, seed_off=2)
-    for e in (ep1, ep2):
-        for i, t in enumerate(e["ledger"]):
-            t["episode"] = e["seed_offset"] - 1
-            t["seed_offset"] = e["seed_offset"]
-    agg = _aggregate_episodes([ep1, ep2])
-    text = breakdown(agg, tmp_path / "breakdown.txt")
-    assert "By episode" in text
-    assert "episode 0 (seed+1)" in text
-    assert "episode 1 (seed+2)" in text
-    assert "all" in text
-
-
 def test_aggregate_averages_roc_series():
     from report import _aggregate_episodes
 
@@ -162,6 +146,44 @@ def test_metrics_sortino_none_when_no_downside():
     assert m["sortino"] is None
 
 
+def test_metrics_ulcer_index_and_upi_hand_computed():
+    from report import metrics
+
+    # 5 days, one shallow 1% dip on day 3, otherwise clean up-and-right.
+    net = np.array([1000.0, 1010.0, 1020.0, 1009.8, 1030.0, 1050.0])
+    m = metrics(net, periods_per_year=252.0, rf_annual=0.0, freq="daily")
+    peak = np.maximum.accumulate(net)
+    dd = (peak - net) / peak
+    ui = float(np.sqrt(np.mean(np.square(dd))))
+    day_rets = net[1:] / net[:-1] - 1.0
+    mean = float(np.mean(day_rets))
+    assert m["ulcer_index"] == pytest.approx(ui, rel=1e-9)
+    assert m["upi"] == pytest.approx(mean * 252.0 / ui, rel=1e-9)
+    assert m["upi"] > 0.0
+
+
+def test_metrics_upi_none_when_no_drawdown():
+    from report import metrics
+
+    net = np.array([1000.0, 1020.0, 1040.0, 1060.0])  # never in a hole
+    m = metrics(net, periods_per_year=252.0, freq="daily")
+    assert m["ulcer_index"] == pytest.approx(0.0)
+    assert m["upi"] is None
+
+
+def test_metrics_upi_rewards_shallow_short_dips():
+    from report import metrics
+
+    # Same endpoint / same returns, but A has one deep dip and B has the same
+    # loss spread over days at depth: Ulcer penalizes *duration at depth*, so
+    # the shallow variant must score strictly higher UPI.
+    a = np.array([1000.0, 1100.0, 900.0, 1100.0, 1200.0])  # deep V
+    b = np.array([1000.0, 1100.0, 1000.0, 900.0, 1200.0])  # long shallow slide
+    ma = metrics(a, periods_per_year=252.0, freq="daily")
+    mb = metrics(b, periods_per_year=252.0, freq="daily")
+    assert ma["upi"] > mb["upi"]
+
+
 def test_metrics_rf_lowers_per_bar_mean():
     from report import metrics
 
@@ -169,43 +191,3 @@ def test_metrics_rf_lowers_per_bar_mean():
     m0 = metrics(net, periods_per_year=72576.0)
     m1 = metrics(net, periods_per_year=72576.0, rf_annual=0.045)
     assert m1["sharpe"] < m0["sharpe"]  # rf drag on excess return
-
-
-def test_trade_stats_profit_factor_none_without_losses():
-    from report import _trade_stats
-
-    st = _trade_stats([{"realized_pnl": 5.0}, {"realized_pnl": 7.0}])
-    assert st["pf"] is None
-    assert st["win_rate"] == pytest.approx(100.0)
-
-
-def test_figure1_renders_with_per_symbol_and_episode_overlays(tmp_path):
-    from report import figure1
-
-    ep = _synthetic_episode(3)
-    result = {
-        "ledger": ep["ledger"],
-        "net": ep["net"],
-        "gross": ep["gross"],
-        "steps": ep["steps"],
-        "per_symbol": ep["per_symbol"],
-        "episodes": [{"net": ep["net"], "gross": ep["gross"], "steps": ep["steps"]}],
-    }
-    out = figure1(result, tmp_path / "figure1.png")
-    assert out.exists() and out.stat().st_size > 0
-
-
-def test_figure1_overlays_switch_disables_overlay_traces(tmp_path):
-    from report import figure1
-
-    ep = _synthetic_episode(4)
-    result = {
-        "ledger": [],
-        "net": ep["net"],
-        "gross": ep["gross"],
-        "steps": ep["steps"],
-        "per_symbol": ep["per_symbol"],
-        "episodes": [{"net": ep["net"], "gross": ep["gross"], "steps": ep["steps"]}],
-    }
-    out = figure1(result, tmp_path / "plain.png", overlays=False)
-    assert out.exists() and out.stat().st_size > 0

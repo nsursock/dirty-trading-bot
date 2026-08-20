@@ -45,19 +45,6 @@ def test_periods_per_year_derived_from_bar_not_hardcoded_252():
     assert _periods_per_year(cfg) == pytest.approx(252 * 1440 / 5)  # 72576, not 252
 
 
-def test_trade_stats_not_annualized():
-    from report import _trade_stats
-
-    st = _trade_stats([{"realized_pnl": 10.0}, {"realized_pnl": -5.0}, {"realized_pnl": 2.0}])
-    assert st["num"] == 3
-    assert st["net"] == pytest.approx(7.0)
-    # per-trade ratios (no sqrt(n) bar annualization on trade PnL)
-    mean = 7.0 / 3.0
-    std = np.std(np.array([10.0, -5.0, 2.0]))
-    assert st["sharpe"] == pytest.approx(mean / std, rel=1e-9)
-    assert st["calmar"] == pytest.approx((7.0 / 1000.0) / 0.005, rel=1e-9)
-
-
 # --- #2: Optuna objective split from locked test ---------------------------
 
 

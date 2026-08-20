@@ -1,11 +1,17 @@
-"""Financial + ML health reporting and plotting engine.
+"""Policy rollout + search objective; reporting is delegated to
+`dirty-fin-reports <https://github.com/nsursock/dirty-fin-reports>`_.
 
-``run_test`` drives a trained joint policy deterministically on a fresh
-(synthetic) test bundle, reconstructs the trade ledger from the env state,
-and emits: the ledger CSV, a ``tabulate`` breakdown, Figure 1 (equity /
-returns / drawdown / return distribution) and Figure 2 (leverage / collateral
-/ direction / exit types). ``ml_health`` reads the SB3-style progress CSVs
-and renders a 4x3 diagnostic figure per agent.
+This module keeps the pieces that only the bot can do — driving a trained
+joint policy deterministically over a fresh synthetic test bundle and
+reconstructing the trade ledger from the env state — plus the hyperparameter
+search objective (``validate`` / ``dsr``). The reporting layer proper (risk
+metrics, plausibility checks, verdicts, breakdown text, PNG figures and
+``report.json``) is provided by the ``dirty_fin_reports`` package:
+
+* ``run_test`` emits the closed-position ledger the package consumes;
+* ``generate_report`` writes ``trades.csv`` and hands the run folder to
+  ``dirty_fin_reports.simple.report.run_reporter``, which emits
+  ``report.json``, ``breakdown.txt`` and the verdict-named PNGs.
 """
 
 from __future__ import annotations
@@ -13,15 +19,10 @@ from __future__ import annotations
 import csv
 import logging
 import math
-import random
 import time
-from collections import Counter
 from pathlib import Path
 
 import numpy as np
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-from tabulate import tabulate
 from tqdm import tqdm
 
 from data import SYMBOLS, TRADING_DAYS, build_high_view, generate, mgr_obs
@@ -422,9 +423,9 @@ def _sort_ledger(ledger):
 
 def write_ledger(ledger, path):
     cols = [
-        "trade_id", "episode", "symbol", "side", "opened_at", "closed_at", "entry_price",
-        "exit_price", "notional", "leverage", "collateral", "entry_conviction",
-        "fee", "funding", "realized_pnl", "exit_type",
+        "trade_id", "episode", "seed_offset", "symbol", "side", "opened_at", "closed_at",
+        "entry_price", "exit_price", "notional", "leverage", "collateral", "equity_before",
+        "entry_conviction", "fee", "funding", "realized_pnl", "exit_type",
     ]
     with open(path, "w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=cols, extrasaction="ignore")
@@ -471,27 +472,32 @@ def _resample_equity(net, periods_per_year, freq):
     Equity is marked at the close of every ``freq`` window and the per-window
     return is ``end/start - 1``, so Sharpe / Sortino are computed on portfolio
     returns at the reporting cadence instead of per-bar steps (which are
-    mostly flat plateaus between trade closes). Returns ``(None, ppy)`` when
-    ``freq`` is coarser than the data or there are fewer than two windows.
+    mostly flat plateaus between trade closes). Returns ``(None, ppy, net)``
+    when ``freq`` is coarser than the data or there are fewer than two
+    windows; otherwise ``(rets, ppy, levels)`` where ``levels`` is the equity
+    marked at each window close (used for drawdown metrics).
     """
     fppy = _FREQ_PPY.get(freq)
     if fppy is None or fppy <= 0:
         raise ValueError(f"unknown reporting frequency: {freq!r}")
     bars_per_agg = max(round(periods_per_year / fppy), 1)
     if bars_per_agg <= 1:
-        return None, periods_per_year
+        return None, periods_per_year, np.asarray(net, dtype=float)
     n = len(net)
     starts = net[np.arange(0, n - 1, bars_per_agg)]
     ends = net[np.minimum(np.arange(bars_per_agg, n, bars_per_agg), n - 1)]
     k = min(len(starts), len(ends))
     if k < 2:
-        return None, periods_per_year
-    return ends[:k] / starts[:k] - 1.0, fppy
+        return None, periods_per_year, np.asarray(net, dtype=float)
+    return ends[:k] / starts[:k] - 1.0, fppy, np.concatenate([starts[:1], ends[:k]])
 
 
 def metrics(net, periods_per_year=252, rets=None, basis="account",
             rf_annual=0.0, freq="bar"):
-    """Risk metrics on a single equity curve.
+    """Risk metrics on a single equity curve (search objective).
+
+    This remains for the hyperparameter search objective (``validate`` /
+    ``dsr``); the final report metrics come from ``dirty_fin_reports``.
 
     ``net`` must be the bar ``net_curve`` from ``run_test``. ``periods_per_year``
     is the native bar cadence from ``_periods_per_year(cfg)``.
@@ -510,6 +516,14 @@ def metrics(net, periods_per_year=252, rets=None, basis="account",
     the dollar equity curve. ``sortino`` is ``None`` when the sample has fewer
     than two downside periods (or zero downside dispersion) — it is undefined,
     not a lucky huge number.
+
+    ``ulcer_index`` is the root-mean-square of the percentage drawdowns over
+    the reporting cadence: deep *or* prolonged holes both inflate it, so a
+    curve with shallow, short dips scores low. ``upi`` (Ulcer Performance
+    Index / Martin Ratio) is the annualized excess mean return divided by the
+    Ulcer Index — the goal-state metric for a "healthy staircase" equity
+    curve. It is ``None`` when the Ulcer Index is ~0 (the curve never left its
+    running high, so the ratio is undefined, not infinite).
     """
     if rets is None or np.asarray(rets).size == 0:
         rets = _returns(net)
@@ -517,8 +531,9 @@ def metrics(net, periods_per_year=252, rets=None, basis="account",
     if len(rets) < 2 or np.std(rets) == 0:
         return {}
     ppy_bar = periods_per_year
+    levels = np.asarray(net, dtype=float)
     if freq != "bar":
-        agg, ppy = _resample_equity(np.asarray(net, dtype=float), periods_per_year, freq)
+        agg, ppy, levels = _resample_equity(levels, periods_per_year, freq)
         if agg is not None:
             rets = agg
             periods_per_year = ppy
@@ -532,14 +547,22 @@ def metrics(net, periods_per_year=252, rets=None, basis="account",
         dstd = float(np.std(down))
         if dstd > 1e-12:
             sortino = mean / (dstd + 1e-12) * np.sqrt(periods_per_year)
-    peak = np.maximum.accumulate(net)
-    dd = (peak - net) / peak
+    peak = np.maximum.accumulate(levels)
+    dd = (peak - levels) / peak
+    ulcer_index = float(np.sqrt(np.mean(np.square(dd))))
+    upi = None
+    if ulcer_index > 1e-12:
+        upi = mean * periods_per_year / ulcer_index
+    peak_net = np.maximum.accumulate(net)
+    dd_net = (peak_net - net) / peak_net
     years = len(net) / ppy_bar
     cagr = (net[-1] / net[0]) ** (1.0 / years) - 1.0 if years > 0 and net[0] > 0 else 0.0
     return {
         "sharpe": mean / (std + 1e-12) * np.sqrt(periods_per_year),
         "sortino": sortino,
-        "max_drawdown": float(np.max(dd)),
+        "max_drawdown": float(np.max(dd_net)),
+        "ulcer_index": ulcer_index,
+        "upi": upi,
         "cagr": cagr,
         "final_equity": float(net[-1]),
         "total_return": float(net[-1] / net[0] - 1.0),
@@ -671,765 +694,6 @@ def dsr(net, periods_per_year=252, n_trials=1) -> dict:
     }
 
 
-_BD_COLS = ["label", "num trades", "win rate %", "avg win", "avg loss",
-            "net profit", "sharpe", "max dd", "risk reward", "sortino", "calmar", "profit factor"]
-
-
-def _config_lines(cfg) -> list[str]:
-    d = cfg.get("data", {})
-    e = cfg.get("env", {})
-    r = cfg.get("reward", {})
-    h = cfg.get("hrl", {})
-    w = cfg.get("worker", {})
-    ev = cfg.get("eval", {})
-    n_sym = int(d.get("n_symbols", 0) or 0)
-    # The eval rollout uses max_positions_per_symbol position slots per symbol
-    # (see _test_env), not the training n_envs_per_symbol.
-    per_sym = max(1, int(ev.get("max_positions_per_symbol", 1)))
-    return [
-        f"seed: {cfg.get('seed')}",
-        f"symbols: {d.get('n_symbols')}  steps: {d.get('n_steps')}  dt_days: {d.get('dt_days')}",
-        f"env: {n_sym} symbols x {per_sym} = {n_sym * per_sym} test envs  "
-        f"lev {e.get('lev_min')}–{e.get('lev_max')}x  risk {float(e.get('risk_min',0))*100:.0f}–{float(e.get('risk_max',0))*100:.0f}%  "
-        f"eq={e.get('initial_balance')}  fees o/c={e.get('open_fee_rate')}/{e.get('close_fee_rate')}  liq={e.get('liquidation_fee_rate')}  hold/day={e.get('holding_fee_daily')}",
-        f"reward: {r.get('mode')}  dd_pen={r.get('drawdown_penalty')}  clip={r.get('reward_clip')}  trade_knob={e.get('trade_knob')}",
-        f"hrl: goal_every={h.get('goal_every')}  goal_dim={h.get('goal_dim')}  "
-        f"manager n_steps={cfg.get('manager',{}).get('n_steps')}  worker net={w.get('net_arch')} lr={w.get('learning_rate')}",
-    ]
-
-
-def _trade_stats(trades, base=1000.0):
-    """Descriptive per-trade stats.
-
-    ``max_dd`` is the peak-to-trough drawdown of the trade-PnL cumsum scaled by
-    the total account capital in play (``n_accounts * base``), so a subgroup
-    spanning N accounts does not read as an N-fold drawdown. Sharpe / Sortino /
-    Calmar are per-trade (NOT annualized): mean/std, mean/downside-std, and
-    total-return/max-drawdown respectively.
-    """
-    pnls = np.array([float(t.get("realized_pnl", 0.0) or 0.0) for t in trades], dtype=float)
-    n = int(pnls.size)
-    if n == 0:
-        return dict(num=0, win_rate=0.0, avg_win=0.0, avg_loss=0.0, net=0.0, sharpe=0.0,
-                    max_dd=0.0, rr=0.0, sortino=0.0, calmar=0.0, pf=0.0)
-    wins, losses = pnls[pnls > 0], pnls[pnls < 0]
-    net = float(pnls.sum())
-    win_rate = 100.0 * float((pnls > 0).mean())
-    avg_win = float(wins.mean()) if wins.size else 0.0
-    avg_loss = float(losses.mean()) if losses.size else 0.0
-    accts = {(int(t.get("episode", 0) or 0), str(t.get("symbol", ""))) for t in trades}
-    n_accts = max(len(accts), 1)
-    cum = np.cumsum(pnls)
-    peak = np.maximum.accumulate(cum)
-    dd_min = float((cum - peak).min())
-    max_dd = 100.0 * abs(dd_min) / max(abs(base) * n_accts, 1.0) if abs(dd_min) > 1e-9 else 0.0
-    rr = avg_win / abs(avg_loss) if losses.size and abs(avg_loss) > 1e-12 else 0.0
-    gw = float(wins.sum()) if wins.size else 0.0
-    gl = float(abs(losses.sum())) if losses.size else 0.0
-    # Profit factor is undefined when every trade wins (no losses to divide
-    # by). Report None instead of an impossible "999".
-    pf = (gw / gl) if gl > 1e-12 else (None if gw > 0 else 0.0)
-    std = float(pnls.std())
-    sharpe = float(pnls.mean()) / std if n > 1 and std > 1e-12 else 0.0
-    dstd = float(losses.std()) if losses.size > 1 else 0.0
-    sortino = float(pnls.mean()) / dstd if dstd > 1e-12 else 0.0
-    total_ret = net / max(abs(base) * n_accts, 1.0)
-    calmar = total_ret / (max_dd / 100.0) if max_dd > 1e-9 else 0.0
-    return dict(num=n, win_rate=win_rate, avg_win=avg_win, avg_loss=avg_loss, net=net,
-                sharpe=sharpe, max_dd=max_dd, rr=rr, sortino=sortino, calmar=calmar, pf=pf)
-
-
-def _bd_row(label, st):
-    pf = st["pf"]
-    pf_fmt = "" if pf is None else f"{pf:.4f}"
-    sortino = st["sortino"]
-    sortino_fmt = "" if sortino is None else f"{sortino:.4f}"
-    return [label, st["num"], round(st["win_rate"], 2), round(st["avg_win"], 4),
-            round(st["avg_loss"], 4), round(st["net"], 4), round(st["sharpe"], 4),
-            round(st["max_dd"], 2), round(st["rr"], 4), sortino_fmt,
-            round(st["calmar"], 4), pf_fmt]
-
-
-def _bd_table(title, groups, portfolio):
-    rows = [_BD_COLS]
-    for label, st in groups:
-        rows.append(_bd_row(label, st))
-    rows.append(_bd_row("portfolio", portfolio))
-    return [title, "", tabulate(rows, headers="firstrow", tablefmt="grid", floatfmt=".4f",
-                                colalign=("left",) + ("right",) * (len(_BD_COLS) - 1)), ""]
-
-
-def breakdown(result, path, cfg=None, rets=None, basis="account"):
-    ledger = result["ledger"]
-    net = np.asarray(result["net"])
-    base = float(net[0]) if net.size else 1000.0
-    ppy = _periods_per_year(cfg) if cfg is not None else 252
-    ret_freq = (cfg.get("returns") or {}).get("freq", "daily") if cfg is not None else "bar"
-    rf_annual = float((cfg.get("returns") or {}).get("rf_annual", 0.045)) if cfg is not None else 0.0
-    m = metrics(net, periods_per_year=ppy, rets=rets, basis=basis,
-                rf_annual=rf_annual, freq=ret_freq)
-    port = _trade_stats(ledger, base=base)
-    if m:
-        port["sharpe"] = m.get("sharpe", 0.0)
-        port["sortino"] = m.get("sortino", 0.0)
-        port["max_dd"] = 100.0 * m.get("max_drawdown", 0.0)
-        port["calmar"] = m.get("cagr", 0.0) / max(abs(m.get("max_drawdown", 0.0)), 1e-9)
-
-    def _bucket(trades, keyfn, order):
-        groups = {}
-        for t in trades:
-            groups.setdefault(keyfn(t), []).append(t)
-        return [(lab, _trade_stats(groups[lab], base=base)) for lab in order if lab in groups]
-
-    n = max(len(ledger), 1)
-    by_symbol = sorted({t["symbol"] for t in ledger})
-    sym_groups = [(s, _trade_stats([t for t in ledger if t["symbol"] == s], base=base)) for s in by_symbol]
-
-    ep_order = sorted({int(t.get("episode", 0) or 0) for t in ledger})
-    by_episode = []
-    for e in ep_order:
-        ep_trades = [t for t in ledger if int(t.get("episode", 0) or 0) == e]
-        off = next((t.get("seed_offset") for t in ep_trades if t.get("seed_offset") is not None), "?")
-        by_episode.append((f"episode {e} (seed+{off})", _trade_stats(ep_trades, base=base)))
-    if len(ep_order) > 1:
-        by_episode.append(("all", _trade_stats(ledger, base=base)))
-
-    by_side = _bucket(ledger, lambda t: "bull (long)" if t["side"] == "long" else "bear (short)",
-                      ["bull (long)", "bear (short)"])
-    by_exit = _bucket(ledger, lambda t: t["exit_type"],
-                      ["take_profit", "stop_loss", "market_close", "liquidation"])
-    by_outcome = _bucket(ledger, lambda t: ("win" if (t.get("realized_pnl", 0) or 0) > 0 else
-                                            "loss" if (t.get("realized_pnl", 0) or 0) < 0 else "breakeven"),
-                         ["win", "loss", "breakeven"])
-
-    def _lev(t):
-        v = float(t.get("leverage", 0) or 0)
-        if v < 5:
-            return "cruiser (1-5x)"
-        if v < 10:
-            return "charger (5-10x)"
-        if v < 20:
-            return "turbo (10-20x)"
-        if v < 50:
-            return "warp (20-50x)"
-        if v < 100:
-            return "hyper (50-100x)"
-        return "singularity (100x+)"
-    by_lev = _bucket(ledger, _lev, ["cruiser (1-5x)", "charger (5-10x)", "turbo (10-20x)",
-                                    "warp (20-50x)", "hyper (50-100x)", "singularity (100x+)"])
-
-    low_tf = ((cfg.get("data") or {}).get("timeframes") or {}).get("low", "5m") if cfg is not None else "5m"
-    from data import _tf_minutes
-    bar_secs = float(_tf_minutes(low_tf)) * 60.0
-
-    def _hold(t):
-        d = int(t.get("closed_at", 0) or 0) - int(t.get("opened_at", 0) or 0)
-        secs = d * bar_secs
-        if secs <= 0:
-            return "unmatched (0s)"
-        if secs < 30:
-            return "flash (<30s)"
-        if secs < 120:
-            return "scalp (30s-2m)"
-        if secs < 900:
-            return "sprint (2-15m)"
-        if secs < 3600:
-            return "sit (15-60m)"
-        return "camp (1h+)"
-    by_hold = _bucket(ledger, _hold, ["unmatched (0s)", "flash (<30s)", "scalp (30s-2m)",
-                                      "sprint (2-15m)", "sit (15-60m)", "camp (1h+)"])
-
-    ret_basis = (dict(cfg.get("returns", {})) if cfg is not None else {}).get("basis", "account")
-
-    def _roe(t):
-        if ret_basis == "collateral":
-            base = float(t.get("collateral", 0) or 0)
-        else:
-            base = float(t.get("equity_before", 0) or 0)
-        r = 10_000.0 * (float(t.get("realized_pnl", 0) or 0)) / max(abs(base), 1e-9)
-        if r < 0:
-            return "dip (<0 bps)"
-        if r < 10:
-            return "scratch (<10 bps)"
-        if r < 100:
-            return "single-R (10-100 bps)"
-        return "multi-R (>=100 bps)"
-    by_roe = _bucket(ledger, _roe, ["dip (<0 bps)", "scratch (<10 bps)",
-                                    "single-R (10-100 bps)", "multi-R (>=100 bps)"])
-
-    def _collateral(t):
-        v = float(t.get("collateral", 0) or 0)
-        if v < 50:
-            return "pocket (<$50)"
-        if v < 200:
-            return "small ($50-$200)"
-        if v < 1000:
-            return "standard ($200-$1k)"
-        return "loaded (>=$1k)"
-    by_collateral = _bucket(ledger, _collateral, ["pocket (<$50)", "small ($50-$200)",
-                                                  "standard ($200-$1k)", "loaded (>=$1k)"])
-
-    def _notional(t):
-        v = float(t.get("notional", 0) or 0)
-        if v < 1000:
-            return "toy (<$1k)"
-        if v < 10_000:
-            return "standard ($1k-$10k)"
-        if v < 50_000:
-            return "size ($10k-$50k)"
-        return "whale (>=$50k)"
-    by_notional = _bucket(ledger, _notional, ["toy (<$1k)", "standard ($1k-$10k)",
-                                              "size ($10k-$50k)", "whale (>=$50k)"])
-
-    def _heat(t):
-        eq = float(t.get("equity_before", base) or base)
-        r = eq / max(base, 1e-9)
-        if r < 0.80:
-            return "underwater (<80% eq)"
-        if r < 0.95:
-            return "bruised (80-95% eq)"
-        if r < 1.05:
-            return "par (95-105% eq)"
-        if r < 1.30:
-            return "green (105-130% eq)"
-        return "moon (>=130% eq)"
-    by_heat = _bucket(ledger, _heat, ["underwater (<80% eq)", "bruised (80-95% eq)", "par (95-105% eq)",
-                                      "green (105-130% eq)", "moon (>=130% eq)"])
-
-    def _bite(t):
-        coll = max(abs(float(t.get("collateral", 0) or 0)), 1e-9)
-        pct = 100.0 * abs(float(t.get("realized_pnl", 0) or 0)) / coll
-        if pct < 0.5:
-            return "dust (<0.5% margin)"
-        if pct < 2:
-            return "scratch (0.5-2%)"
-        if pct < 8:
-            return "nibble (2-8%)"
-        if pct < 20:
-            return "bite (8-20%)"
-        return "feast (>=20%)"
-    by_bite = _bucket(ledger, _bite, ["dust (<0.5% margin)", "scratch (0.5-2%)", "nibble (2-8%)",
-                                      "bite (8-20%)", "feast (>=20%)"])
-
-    def _liq(t):
-        lev = max(abs(float(t.get("leverage", 0) or 0)), 1e-9)
-        e = (cfg.get("env") or {}) if cfg is not None else {}
-        base = float(e.get("liq_threshold_base", 0.90))
-        floor = float(e.get("liq_threshold_floor", 0.67))
-        ref = float(e.get("liq_threshold_ref_lev", 2.0))
-        hi = float(e.get("liq_threshold_hi_lev", 150.0))
-        lo = float(e.get("liq_threshold_lo_lev", 1.0))
-        slope_lo = (base - 1.0) / max(ref - lo, 1e-6)
-        slope_hi = (floor - base) / max(hi - ref, 1e-6)
-        thr = (1.0 + slope_lo * (lev - lo)) if lev <= ref else (base + slope_hi * (lev - ref))
-        thr = min(1.0, max(floor, thr))
-        # ``thr`` is the perp loss fraction at which liquidation fires, so the
-        # required adverse underlying move is ``thr / leverage``.
-        dist = 100.0 * thr / lev
-        if dist < 2:
-            return "knife-edge (<2%)"
-        if dist < 5:
-            return "tight (2-5%)"
-        if dist < 15:
-            return "cushion (5-15%)"
-        return "fortress (>=15%)"
-    by_liq = _bucket(ledger, _liq, ["knife-edge (<2%)", "tight (2-5%)",
-                                    "cushion (5-15%)", "fortress (>=15%)"])
-
-    def _fee_drag(t):
-        notional = max(abs(float(t.get("notional", 0) or 0)), 1e-9)
-        bps = 10_000.0 * float(t.get("fee", 0) or 0) / notional
-        if bps <= 0:
-            return "free (maker)"
-        if bps < 5:
-            return "light (<5 bps)"
-        return "heavy (>=5 bps)"
-    by_fee = _bucket(ledger, _fee_drag, ["free (maker)", "light (<5 bps)", "heavy (>=5 bps)"])
-
-    margin_mode = ((cfg.get("env") or {}).get("margin_mode", "isolated")) if cfg is not None else "isolated"
-    by_margin = _bucket(ledger, lambda t: ("pool (cross)" if margin_mode == "cross" else "loner (isolated)"),
-                        ["loner (isolated)", "pool (cross)"])
-
-    def _vintage(i):
-        frac = i / n
-        return "opening act (first 20%)" if frac < 0.2 else "encore (last 20%)" if frac >= 0.8 else "mid-set (20-80%)"
-    _vgroups = {}
-    for _i, _t in enumerate(ledger):
-        _vgroups.setdefault(_vintage(_i), []).append(_t)
-    by_vintage = [(lab, _trade_stats(_vgroups[lab], base=base))
-                  for lab in ("opening act (first 20%)", "mid-set (20-80%)", "encore (last 20%)")
-                  if lab in _vgroups]
-
-    lines: list[str] = ["BREAKDOWN", "=========", ""]
-    if cfg is not None:
-        lines += _config_lines(cfg)
-        lines.append("")
-    lines.append("Portfolio risk (Sharpe/Sortino/Calmar) is computed from the bar-indexed "
-                 "net curve; subgroup rows report descriptive trade stats only.")
-    lines.append(f"portfolio: {port['num']} trades  final_equity={float(net[-1]):.2f}  "
-                 f"ret={m.get('total_return', 0):+.2%}  sharpe={port['sharpe']:.3f}  max_dd={port['max_dd']:.2f}%")
-    lines.append("")
-    for title, groups in [
-        ("By symbol", sym_groups),
-        ("By episode", by_episode),
-        ("By position direction", by_side),
-        ("By exit", by_exit),
-        ("By outcome", by_outcome),
-        ("By leverage", by_lev),
-        ("By hold duration", by_hold),
-        ("By return" if ret_basis == "collateral" else "By RoE", by_roe),
-        ("By collateral", by_collateral),
-        ("By notional", by_notional),
-        ("By equity heat", by_heat),
-        ("By bite size", by_bite),
-        ("By liquidation distance", by_liq),
-        ("By fee drag", by_fee),
-        ("By margin type", by_margin),
-        ("By trade vintage", by_vintage),
-    ]:
-        lines += _bd_table(title, groups, port)
-
-    lines.append("Baselines (after fees/funding/slip)")
-    lines.append(f"  policy: {float(net[0]):.2f} -> {float(net[-1]):.2f}  ({m.get('total_return', 0):+.3f})")
-    lines.append(f"  flat: 1000.00 -> 1000.00  (+0.000)")
-    text = "\n".join(lines)
-    with open(path, "w") as fh:
-        fh.write(text)
-    return text
-
-
-# --- iso-trading-bot-style figure scaffolding (synthwave / ghibli themes) ---
-
-
-def _rgba(hex_color: str, alpha: float) -> str:
-    r, g, b = (int(hex_color[i : i + 2], 16) for i in (1, 3, 5))
-    return f"rgba({r},{g},{b},{alpha})"
-
-
-# Local theme palettes (repo-tracked). Keys mirror dirty-mkt-data's Theme
-# dataclass so they slot straight into the shared _palette() mapping.
-_LOCAL_THEMES = {
-    "cyberpunk": dict(
-        background="#0b0b16", plot_background="#121222", grid="#1f1f38",
-        text="#e0e0e8", up="#00f3ff", down="#ff0055", accent="#00ff66",
-    ),
-    "nordic_frost": dict(
-        background="#f4f7f6", plot_background="#ffffff", grid="#e2e8e6",
-        text="#2e4057", up="#048a81", down="#858ae3", accent="#ff8a5b",
-    ),
-    "tokyo_midnight": dict(
-        background="#1a1b26", plot_background="#24283b", grid="#414868",
-        text="#c0caf5", up="#7aa2f7", down="#f7768e", accent="#bb9af7",
-    ),
-    "wes_anderson": dict(
-        background="#fbf9f1", plot_background="#f4efe2", grid="#e6decb",
-        text="#33261d", up="#66a182", down="#d1495b", accent="#edae49",
-    ),
-    "brutalist_terminal": dict(
-        background="#000000", plot_background="#000000", grid="#1a1a1a",
-        text="#00ff00", up="#00ff00", down="#ff3333", accent="#00ffff",
-    ),
-    "botanical_dark": dict(
-        background="#111b15", plot_background="#18261e", grid="#23372c",
-        text="#d8e2dc", up="#4e8752", down="#b48a60", accent="#a3c1ad",
-    ),
-    "solarized_warm": dict(
-        background="#fdf6e3", plot_background="#eee8d5", grid="#e0dcc7",
-        text="#657b83", up="#2aa198", down="#cb4b16", accent="#268bd2",
-    ),
-    "sunset_drive": dict(
-        background="#15121f", plot_background="#1f1a2e", grid="#2e2542",
-        text="#f0e6ff", up="#ff9966", down="#c71585", accent="#ff5e7e",
-    ),
-}
-
-
-def _theme_pool() -> list[str]:
-    """All usable theme names: local repo themes + dirty-mkt-data package themes."""
-    from dirty_mkt_data.viz.themes import THEMES
-
-    return sorted(_LOCAL_THEMES) + sorted(THEMES)
-
-
-def resolve_theme(theme: str) -> str:
-    """Resolve a requested theme to a concrete name; ``random`` picks one at random."""
-    if theme == "random":
-        return random.choice(_theme_pool())
-    return theme
-
-
-def _palette(theme: str) -> dict:
-    """Map a theme onto the iso-trading-bot ``_C`` palette roles
-    (up=positive, down=negative, accent=highlight).
-
-    Local repo themes (see ``_LOCAL_THEMES``: cyberpunk, nordic_frost,
-    tokyo_midnight, wes_anderson, brutalist_terminal, botanical_dark,
-    solarized_warm, sunset_drive) win; anything else falls through to the
-    dirty-mkt-data package themes (synthwave / ghibli / valorant).
-
-    ``muted`` (tick labels / subtitles) is derived from the background's
-    brightness so it always has readable contrast on light *and* dark themes.
-    """
-    from dirty_mkt_data.viz.themes import Theme, THEMES
-
-    local = _LOCAL_THEMES.get(theme)
-    if local is not None:
-        t = Theme(name=theme, **local)
-    else:
-        t = THEMES[theme]
-    up, down, accent = t.up, t.down, t.accent
-    r, g, b = (int(t.background[i : i + 2], 16) for i in (1, 3, 5))
-    dark_bg = (r + g + b) / 3.0 < 128.0
-    muted = "#9AA4B2" if dark_bg else "#5C6570"
-    return {
-        "bg": t.background,
-        "panel": t.plot_background,
-        "ink": t.text,
-        "muted": muted,
-        "grid": t.grid,
-        "spine": t.grid,
-        "cyan": up,
-        "cyan_soft": _rgba(up, 0.22),
-        "cyan_glow": _rgba(up, 0.45),
-        "magenta": down,
-        "magenta_soft": _rgba(down, 0.28),
-        "lime": accent,
-        "lime_soft": _rgba(accent, 0.20),
-        "violet": accent,
-        "amber": accent,
-        "slate": muted,
-        "long": up,
-        "short": down,
-    }
-
-
-_FONT = dict(family="JetBrains Mono, Menlo, Monaco, Consolas, monospace")
-
-
-def _base_layout(c: dict, **extra) -> dict:
-    layout = dict(
-        paper_bgcolor=c["bg"],
-        plot_bgcolor=c["panel"],
-        font=dict(family=_FONT["family"], color=c["ink"]),
-        title_font=dict(size=18, color=c["cyan"], family=_FONT["family"]),
-        margin=dict(l=60, r=32, t=72, b=52),
-        legend=dict(bgcolor="rgba(0,0,0,0)", borderwidth=0, font=dict(size=11, color=c["ink"])),
-        hovermode="x unified",
-        hoverlabel=dict(
-            bgcolor=c["panel"], bordercolor=c["cyan"],
-            font=dict(color=c["ink"], size=11, family=_FONT["family"]),
-        ),
-    )
-    layout.update(extra)
-    return layout
-
-
-def _style_axes(fig, rows, cols, c: dict, pct_y=None, pct_x=None):
-    pct_y = pct_y or set()
-    pct_x = pct_x or set()
-    for r in range(1, rows + 1):
-        for cc in range(1, cols + 1):
-            fig.update_xaxes(
-                row=r, col=cc, showgrid=True, gridcolor=c["grid"], gridwidth=1,
-                zeroline=False, showline=True, linecolor=c["spine"], linewidth=1, mirror=False,
-                tickfont=dict(size=10, color=c["muted"]), title_font=dict(size=11, color=c["muted"]),
-                tickformat=".1%" if (r, cc) in pct_x else None, automargin=True,
-            )
-            fig.update_yaxes(
-                row=r, col=cc, showgrid=True, gridcolor=c["grid"], gridwidth=1,
-                zeroline=False, showline=True, linecolor=c["spine"], linewidth=1, mirror=False,
-                tickfont=dict(size=10, color=c["muted"]), title_font=dict(size=11, color=c["muted"]),
-                tickformat=".1%" if (r, cc) in pct_y else None, automargin=True,
-            )
-
-
-def _write_png(fig, path, width=1280, height=920, scale=2):
-    fig.write_image(str(path), format="png", width=width, height=height, scale=scale)
-
-
-def figure1(result, path, theme="synthwave", overlays=True, ret_series=None):
-    c = _palette(theme)
-    net, gross = np.asarray(result["net"]), np.asarray(result["gross"])
-    steps = np.asarray(result["steps"])
-    peak = np.maximum.accumulate(net)
-    dd = (net - peak) / np.maximum(peak, 1e-8)
-    max_dd = float(dd.min())
-    net_ret = float(net[-1] / max(net[0], 1e-8) - 1.0)
-    gross_ret = float(gross[-1] / max(gross[0], 1e-8) - 1.0)
-    fees = float(np.sum(gross - net))
-    n_close = len(result["ledger"])
-
-    fig = make_subplots(
-        rows=2, cols=2,
-        subplot_titles=("Equity curve", "Trade returns", "Drawdown", "Return distribution"),
-        horizontal_spacing=0.09, vertical_spacing=0.14,
-    )
-
-    # cost band between gross and net
-    fig.add_trace(go.Scatter(x=steps, y=gross, mode="lines", line=dict(width=0),
-                             showlegend=False, hoverinfo="skip"), 1, 1)
-    fig.add_trace(go.Scatter(x=steps, y=net, mode="lines", fill="tonexty",
-                             fillcolor=c["magenta_soft"], line=dict(color=c["cyan"], width=0),
-                             showlegend=False, hoverinfo="skip"), 1, 1)
-
-    # per-symbol equity (portfolio decomposition, faint)
-    per_symbol = result.get("per_symbol")
-    if overlays and per_symbol is not None and np.asarray(per_symbol).size:
-        for row in np.asarray(per_symbol):
-            fig.add_trace(go.Scatter(x=steps, y=row, mode="lines",
-                                     line=dict(color=c["violet"], width=1.2), opacity=0.35,
-                                     showlegend=False, hoverinfo="skip"), 1, 1)
-    # per-episode equity (multi-episode runs, faint)
-    ep_list = result.get("episodes")
-    if overlays and ep_list:
-        for e in ep_list:
-            fig.add_trace(go.Scatter(x=np.asarray(e["steps"]), y=np.asarray(e["net"]), mode="lines",
-                                     line=dict(color=c["muted"], width=1.2, dash="dot"), opacity=0.5,
-                                     showlegend=False, hoverinfo="skip"), 1, 1)
-
-    # glow under net
-    fig.add_trace(go.Scatter(x=steps, y=net, mode="lines", line=dict(color=c["cyan"], width=7),
-                             opacity=0.2, showlegend=False, hoverinfo="skip"), 1, 1)
-    fig.add_trace(go.Scatter(x=steps, y=net, mode="lines", line=dict(color=c["cyan"], width=2.6), name="Net"), 1, 1)
-    fig.add_trace(go.Scatter(x=steps, y=gross, mode="lines", line=dict(color=c["lime"], width=1.8, dash="dot"), name="Gross"), 1, 1)
-    fig.add_hline(y=float(net[0]), line=dict(color=c["muted"], width=1, dash="dash"), row=1, col=1)
-
-    # True per-trade returns: realized_pnl / collateral at the trade's close
-    # bar. The aggregated bar ROC is diluted across episodes at aligned bar
-    # indices, so a -100% liquidation never surfaces in it; plotting the
-    # ledger's own returns preserves the full picture (liq = -1.0 exactly).
-    xs = np.array([float(t.get("closed_at", 0.0) or 0.0) for t in result["ledger"]], dtype=float)
-    coll = np.array([float(t.get("collateral", 0.0) or 0.0) for t in result["ledger"]], dtype=float)
-    ys = np.where(coll > 1e-9, np.array([float(t.get("realized_pnl", 0.0) or 0.0) for t in result["ledger"]])
-                  / np.maximum(coll, 1e-9), 0.0)
-    liq = np.array([t.get("exit_type") == "liquidation" for t in result["ledger"]]).astype(bool)
-    trade_rets = ys  # full-resolution per-trade returns for the histogram
-    # Rendering is O(trades): with ~100k+ closes (large episodes / stochastic
-    # rollouts) a marker per trade becomes the dominant report cost. Downsample
-    # to a fixed cap while keeping the true counts in the title.
-    _MAX_TRADE_MARKERS = 12_000
-    if ys.size > _MAX_TRADE_MARKERS:
-        _cap = _MAX_TRADE_MARKERS
-        idx = np.linspace(0, ys.size - 1, _cap).round().astype(int)
-        idx = np.unique(idx)
-        xs, ys, liq, coll = xs[idx], ys[idx], liq[idx], coll[idx]
-        sub_rets = ys
-    else:
-        sub_rets = ys
-    win = sub_rets > 0
-    loss = sub_rets <= 0
-    fig.add_trace(go.Scatter(x=xs[win], y=sub_rets[win], mode="markers",
-                             marker=dict(size=7, color=c["magenta"], opacity=0.75, line=dict(width=0)), name="Win"), 1, 2)
-    fig.add_trace(go.Scatter(x=xs[loss & ~liq], y=sub_rets[loss & ~liq], mode="markers",
-                             marker=dict(size=7, color=c["cyan"], opacity=0.75, line=dict(width=0)), name="Loss"), 1, 2)
-    fig.add_trace(go.Scatter(x=xs[liq], y=sub_rets[liq], mode="markers",
-                             marker=dict(size=9, symbol="x", color=c["cyan"], opacity=0.9,
-                                         line=dict(width=0)), name="Liquidation"), 1, 2)
-    fig.add_hline(y=0, line=dict(color=c["spine"], width=1), row=1, col=2)
-    fig.add_hline(y=-1.0, line=dict(color="#FF4D6D", width=1, dash="dash"), row=1, col=2)
-
-    fig.add_trace(go.Scatter(x=steps, y=dd, mode="lines", fill="tozeroy", fillcolor=c["magenta_soft"],
-                             line=dict(color=c["magenta"], width=2.4), name="Drawdown", showlegend=False), 2, 1)
-    fig.add_trace(go.Histogram(x=trade_rets, nbinsx=36, marker=dict(color=c["cyan"], line=dict(color=c["bg"], width=0.6), opacity=0.9),
-                               showlegend=False), 2, 2)
-    fig.add_vline(x=0, line=dict(color=c["muted"], width=1, dash="dash"), row=2, col=2)
-    fig.add_vline(x=float(np.mean(trade_rets)), line=dict(color=c["lime"], width=1.8), row=2, col=2)
-
-    fig.update_layout(**_base_layout(c, title=dict(
-        text=(f"Equity & risk<br><sup style='color:{c['muted']}'>"
-              f"Net {net_ret:+.1%} · gross {gross_ret:+.1%} · costs {fees:,.0f} · max DD {max_dd:.1%} · {n_close} closes"
-              f"{' · markers sampled @ ' + str(_MAX_TRADE_MARKERS) if ys.size > _MAX_TRADE_MARKERS else ''}</sup>"),
-        x=0.01, xanchor="left"),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=1, xanchor="right"),
-        margin=dict(l=60, r=32, t=72, b=88)))
-    fig.update_yaxes(title_text="Equity (USDC)", row=1, col=1)
-    fig.update_yaxes(title_text="Return", row=1, col=2)
-    fig.update_yaxes(title_text="Drawdown", row=2, col=1)
-    fig.update_yaxes(title_text="Count", row=2, col=2)
-    fig.update_xaxes(title_text="Step", row=1, col=1)
-    fig.update_xaxes(title_text="Step", row=1, col=2)
-    fig.update_xaxes(title_text="Step", row=2, col=1)
-    fig.update_xaxes(title_text="Return", row=2, col=2)
-    fig.update_annotations(font=dict(size=13, color=c["lime"]))
-    _style_axes(fig, 2, 2, c, pct_y={(1, 2)}, pct_x={(2, 2)})
-    _write_png(fig, path)
-    return path
-
-
-def figure2(result, path, theme="synthwave"):
-    c = _palette(theme)
-    ledger = result["ledger"]
-    lev = np.asarray([float(t.get("leverage", 0) or 0) for t in ledger])
-    coll = np.asarray([float(t.get("notional", 0) or 0) / (float(t.get("leverage", 0) or 1) or 1) for t in ledger])
-    sides = [t.get("side") for t in ledger]
-    exits = [t.get("exit_type") for t in ledger]
-    exit_colors = {
-        "tp": c["cyan"], "take_profit": c["cyan"], "sl": c["amber"], "stop_loss": c["amber"],
-        "market": c["violet"], "market_close": c["violet"],
-        "liquidation": c["magenta"], "limit": c["slate"], "bankrupt": "#FF4D6D", "none": c["muted"],
-    }
-
-    fig = make_subplots(
-        rows=2, cols=2,
-        subplot_titles=("Leverage", "Collateral", "Direction", "Exit type"),
-        horizontal_spacing=0.09, vertical_spacing=0.14,
-    )
-
-    fig.add_trace(go.Histogram(x=lev if lev.size else [0], nbinsx=24,
-                               marker=dict(color=c["cyan"], line=dict(color=c["bg"], width=0.6), opacity=0.92),
-                               showlegend=False), 1, 1)
-    if lev.size:
-        fig.add_vline(x=float(np.median(lev)), line=dict(color=c["lime"], width=1.8, dash="dash"), row=1, col=1)
-    fig.add_trace(go.Histogram(x=coll if coll.size else [0], nbinsx=24,
-                               marker=dict(color=c["violet"], line=dict(color=c["bg"], width=0.6), opacity=0.92),
-                               showlegend=False), 1, 2)
-    if coll.size:
-        fig.add_vline(x=float(np.median(coll)), line=dict(color=c["lime"], width=1.8, dash="dash"), row=1, col=2)
-
-    cnt = Counter(sides)
-    fig.add_trace(go.Bar(x=["Long", "Short"], y=[cnt.get("long", 0), cnt.get("short", 0)],
-        marker=dict(color=[c["long"], c["short"]], line=dict(width=0), opacity=0.95),
-        text=[cnt.get("long", 0), cnt.get("short", 0)], textposition="outside",
-        textfont=dict(size=12, color=c["ink"]), showlegend=False), 2, 1)
-
-    ecnt = Counter(exits)
-    order = [k for k in ("take_profit", "stop_loss", "market_close", "liquidation", "tp", "sl", "market", "limit", "bankrupt") if k in ecnt]
-    order += [k for k in ecnt if k not in order]
-    if not order:
-        order, vals = ["none"], [0]
-    else:
-        vals = [ecnt[k] for k in order]
-    colors = [exit_colors.get(k, c["muted"]) for k in order]
-    fig.add_trace(go.Bar(x=order, y=vals, marker=dict(color=colors, line=dict(width=0), opacity=0.95),
-        text=vals, textposition="outside", textfont=dict(size=12, color=c["ink"]), showlegend=False), 2, 2)
-
-    fig.update_layout(**_base_layout(c, title=dict(text="Trade anatomy", x=0.01, xanchor="left"),
-        showlegend=False, bargap=0.28))
-    for r in (1, 2):
-        fig.update_yaxes(title_text="Count", row=r, col=1)
-        fig.update_yaxes(title_text="Count", row=r, col=2)
-    fig.update_xaxes(title_text="Leverage (x)", row=1, col=1)
-    fig.update_xaxes(title_text="Initial margin (USDC)", row=1, col=2)
-    fig.update_xaxes(title_text="Side", row=2, col=1)
-    fig.update_xaxes(title_text="Exit type", row=2, col=2)
-    fig.update_annotations(font=dict(size=13, color=c["lime"]))
-    _style_axes(fig, 2, 2, c)
-    _write_png(fig, path)
-    return path
-
-
-_SAC_ALIASES = {
-    "train/loss/policy": ("train/actor_loss",),
-    "train/loss/critic": ("train/critic_loss",),
-    "train/loss/alpha": ("train/ent_coef_loss",),
-    "train/policy/alpha": ("train/ent_coef",),
-}
-PPO_KEYS = (
-    "time/fps", "rollout/ep_rew_mean", "rollout/ep_len_mean",
-    "train/policy_gradient_loss", "train/value_loss", "train/entropy_loss",
-    "train/approx_kl", "train/clip_fraction", "train/explained_variance",
-    "train/learning_rate", "train/n_updates", "train/loss",
-)
-SAC_KEYS = (
-    "time/fps", "rollout/ep_rew_mean", "rollout/ep_len_mean",
-    "train/loss/policy", "train/loss/critic", "train/loss/alpha",
-    "train/policy/alpha", "train/value/q_mean", "train/policy/log_pi_mean",
-    "train/ent_coef", "train/learning_rate", "train/n_updates",
-)
-
-
-def _col_floats(rows, key):
-    ys = []
-    for row in rows:
-        v = row.get(key)
-        if v in (None, ""):
-            ys.append(np.nan)
-            continue
-        try:
-            ys.append(float(v))
-        except (TypeError, ValueError):
-            ys.append(np.nan)
-    return np.asarray(ys, dtype=float)
-
-
-def _series(rows, key):
-    y = _col_floats(rows, key)
-    if np.isfinite(y).any():
-        return y
-    for alt in _SAC_ALIASES.get(key, ()):
-        y = _col_floats(rows, alt)
-        if np.isfinite(y).any():
-            return y
-    return y
-
-
-def _ma_nan(x, w=10):
-    """Causal trailing mean (expanding until w), NaN-aware (iso-trading-bot port)."""
-    y = np.asarray(x, dtype=float)
-    if y.size == 0:
-        return y.copy()
-    w = max(1, int(w))
-    if w == 1:
-        return y.copy()
-    ok = np.isfinite(y)
-    y0 = np.where(ok, y, 0.0)
-    cs_y = np.concatenate([[0.0], np.cumsum(y0)])
-    cs_n = np.concatenate([[0.0], np.cumsum(ok.astype(float))])
-    idx = np.arange(1, y.size + 1)
-    j = np.maximum(0, idx - w)
-    dn = cs_n[idx] - cs_n[j]
-    out = np.full(y.size, np.nan)
-    good = dn > 0
-    out[good] = (cs_y[idx][good] - cs_y[j][good]) / dn[good]
-    return out
-
-
-def ml_health(csv_path, out_path, title="agent", theme="synthwave", ma=10):
-    c = _palette(theme)
-    with open(csv_path) as fh:
-        rows = list(csv.DictReader(fh))
-    if not rows:
-        return None
-    is_sac = "sac" in Path(csv_path).stem.lower()
-    keys = SAC_KEYS if is_sac else PPO_KEYS
-    titles = list(keys) + [""] * (12 - len(keys))
-    xs = _col_floats(rows, "time/total_timesteps")
-    if np.isfinite(xs).any():
-        xlabel = "timesteps"
-    else:
-        xs = np.arange(len(rows), dtype=float)
-        xlabel = "dump"
-
-    fig = make_subplots(rows=4, cols=3, subplot_titles=titles,
-                        horizontal_spacing=0.08, vertical_spacing=0.10)
-    for i, k in enumerate(keys):
-        r, col = divmod(i, 3)
-        r, col = r + 1, col + 1
-        ys = _series(rows, k)
-        mask = np.isfinite(xs) & np.isfinite(ys)
-        x_f, y_f = xs[mask], ys[mask]
-        if y_f.size == 0:
-            fig.update_yaxes(title_text=k.split("/", 1)[-1], row=r, col=col)
-            continue
-        trend = _ma_nan(y_f, ma)
-        mode = "lines+markers" if y_f.size < 80 else "lines"
-        fig.add_trace(go.Scatter(x=x_f, y=y_f, mode=mode, name="raw", legendgroup="raw", showlegend=(i == 0),
-                                 line=dict(color=c["violet"], width=1.5),
-                                 marker=dict(size=5, color=c["violet"], opacity=0.85), opacity=0.9), r, col)
-        fig.add_trace(go.Scatter(x=x_f, y=trend, mode="lines", name=f"MA{ma}", legendgroup="ma", showlegend=(i == 0),
-                                 line=dict(color=c["cyan"], width=2.3)), r, col)
-        fig.update_yaxes(title_text=k.split("/", 1)[-1], row=r, col=col)
-        fig.update_xaxes(title_text=xlabel, row=r, col=col)
-
-    fig.update_layout(**_base_layout(c, title=dict(text=title or Path(csv_path).stem, x=0.01, xanchor="left"),
-        showlegend=True, legend=dict(orientation="h", yanchor="bottom", y=1.02, x=1, xanchor="right"),
-        margin=dict(l=72, r=36, t=88, b=64)))
-    fig.update_annotations(font=dict(size=11, color=c["lime"]))
-    _style_axes(fig, 4, 3, c)
-    _write_png(fig, out_path, width=1480, height=1180)
-    return out_path
-
-
 def _episode_offsets(cfg):
     """Resolve the test seed offsets for ``eval.episodes``.
 
@@ -1515,33 +779,102 @@ def _aggregate_episodes(episodes):
     }
 
 
+def resolve_theme(theme: str) -> str:
+    """Resolve a theme name via the reporting engine (dirty-fin-reports)."""
+    from dirty_fin_reports.simple.viz import resolve_theme as _resolve
+
+    return _resolve(theme)
+
+
+def _report_config(cfg):
+    """Map the bot config onto the reporting engine's ``ReportConfig``."""
+    from dirty_fin_reports.simple.config import ReportConfig
+
+    d = cfg.get("data") or {}
+    e = cfg.get("env") or {}
+    r = cfg.get("returns") or {}
+    rep = cfg.get("report") or {}
+    tf = (d.get("timeframes") or {}).get("low", "5m")
+    return ReportConfig(
+        timeframe=str(tf),
+        initial_balance=float(e.get("initial_balance", 1000.0)),
+        reporting_freq=str(r.get("freq", "daily")),
+        rf_annual=float(r.get("rf_annual", 0.045)),
+        n_steps=int(d.get("n_steps", 400)),
+        start_date=rep.get("start_date"),
+        tick_tilt=bool(rep.get("tick_tilt", True)),
+        tick_angle=float(rep.get("tick_angle", 22.5)),
+        tick_direction=str(rep.get("tick_direction", "down")),
+    )
+
+
+def _plausibility(cfg):
+    """Build a ``Plausibility`` bounds object from the bot config (defaults if absent)."""
+    from dirty_fin_reports.simple.config import Plausibility
+
+    raw = (cfg.get("report") or {}).get("plausibility") or {}
+    if not raw:
+        return Plausibility()
+    bounds = {}
+    for k, v in raw.items():
+        if isinstance(v, (list, tuple)) and len(v) == 2:
+            bounds[k] = (None if v[0] is None else float(v[0]),
+                         None if v[1] is None else float(v[1]))
+    return Plausibility(**bounds)
+
+
+def _flatten_accounts(ledger):
+    """Key each (episode, symbol) account with a unique integer ``episode``.
+
+    The reporting engine reconstructs the portfolio as the mean of one account
+    per ``episode``; the bot runs one account per symbol per episode, so each
+    account gets ``episode = ep * n_symbols + symbol_index`` and the real
+    test-episode draw stays in ``seed_offset``.
+    """
+    syms = sorted({str(t.get("symbol") or "") for t in ledger})
+    sym_index = {s: i for i, s in enumerate(syms)}
+    out = []
+    for t in ledger:
+        t = dict(t)
+        ep = int(t.get("episode", 0) or 0)
+        t["episode"] = ep * len(syms) + sym_index[str(t.get("symbol") or "")]
+        out.append(t)
+    return out
+
+
 def generate_report(cfg, manager, worker, out_dir, norm_state=None, deterministic=None):
+    """Rollout the policy, write ``trades.csv``, and delegate reporting.
+
+    The policy rollout is the only bot-specific step left here: it runs the
+    trained joint policy deterministically over the locked test bundle, tags
+    each closed trade with its episode / seed offset, and writes the ledger
+    CSV. Everything else (risk metrics, plausibility checks, verdict,
+    ``breakdown.txt``, PNG figures, ``report.json`` and agent diagnostics) is
+    produced by ``dirty_fin_reports.simple.report.run_reporter``.
+    """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    theme = resolve_theme((cfg.get("report") or {}).get("theme", "synthwave"))
-    overlays = bool((cfg.get("report") or {}).get("overlays", True))
-    ep_figs = bool((cfg.get("report") or {}).get("episode_figures", False))
-    ret_basis = (cfg.get("returns") or {}).get("basis", "account")
-    ret_freq = (cfg.get("returns") or {}).get("freq", "daily")
-    rf_annual = float((cfg.get("returns") or {}).get("rf_annual", 0.045))
+    rep = cfg.get("report") or {}
+    theme = resolve_theme(rep.get("theme", "synthwave"))
+    overlays = bool(rep.get("overlays", False))
     if deterministic is None:
         deterministic = bool((cfg.get("eval") or {}).get("deterministic", True))
     offsets = _episode_offsets(cfg)
-    log.info("report: %d test episodes (seed offsets %s, theme=%s, overlays=%s, episode_figures=%s, returns=%s, deterministic=%s)",
-             len(offsets), offsets, theme, overlays, ep_figs, ret_basis, deterministic)
+    log.info("report: %d test episodes (seed offsets %s, theme=%s, overlays=%s, deterministic=%s)",
+             len(offsets), offsets, theme, overlays, deterministic)
 
-    episodes = []
+    all_trades = []
     per_ep_steps = max(int((cfg.get("data") or {}).get("n_steps", 400)) - 1, 1)
     pbar = tqdm(total=len(offsets) * per_ep_steps, desc="test phase",
                 unit="step", colour="magenta", leave=True)
     for ep, off in enumerate(offsets):
         t_ep = time.monotonic()
-        raw = run_test(cfg, manager, worker, norm_state=norm_state, seed_offset=off, pbar=pbar,
-                       deterministic=deterministic)
+        raw = run_test(cfg, manager, worker, norm_state=norm_state, seed_offset=off,
+                       pbar=pbar, deterministic=deterministic)
         for t in raw["ledger"]:
             t["episode"] = ep
             t["seed_offset"] = off
-        episodes.append(raw)
+        all_trades.extend(raw["ledger"])
         log.info("report: episode %d/%d (seed%d) done in %.2fs: %d trades, eq=%.4f",
                  ep + 1, len(offsets), off, time.monotonic() - t_ep,
                  len(raw["ledger"]), float(np.asarray(raw["net"])[-1]))
@@ -1553,58 +886,28 @@ def generate_report(cfg, manager, worker, out_dir, norm_state=None, deterministi
         mx.clear_cache()
     pbar.close()
 
-    result = _aggregate_episodes(episodes)
-    log.info("report: %d episodes %d trades final_equity=%.4f",
-             len(offsets), len(result["ledger"]),
-             float(result["net"][-1]) if len(result["net"]) else 0.0)
+    ledger = _flatten_accounts(_sort_ledger(all_trades))
+    write_ledger(ledger, out_dir / "trades.csv")
 
-    rets = None
-    if ret_basis == "collateral" and np.asarray(result.get("roc")).size > 1:
-        rets = np.asarray(result["roc"])[1:]
-    t_figs = time.monotonic()
-    write_ledger(result["ledger"], out_dir / "trades.csv")
-    log.debug("report: trades.csv written in %.2fs (%d rows)",
-              time.monotonic() - t_figs, len(result["ledger"]))
-    breakdown(result, out_dir / "breakdown.txt", cfg, rets=rets, basis=ret_basis)
-    log.debug("report: breakdown.txt written in %.2fs", time.monotonic() - t_figs)
-    figure1(result, out_dir / "figure1.png", theme=theme, overlays=overlays, ret_series=rets)
-    log.debug("report: figure1.png written in %.2fs", time.monotonic() - t_figs)
-    figure2(result, out_dir / "figure2.png", theme=theme)
-    log.debug("report: figure2.png written in %.2fs", time.monotonic() - t_figs)
-    n_ep_figs = 0
-    if ep_figs:
-        for raw in episodes:
-            per_ep = {
-                "ledger": raw["ledger"],
-                "net": _nonempty(raw["net"]),
-                "gross": _nonempty(raw["gross"]),
-                "steps": np.asarray(raw["steps"]),
-                "per_symbol": np.asarray(raw.get("per_symbol"))
-                if np.asarray(raw.get("per_symbol")).size else None,
-            }
-            ep_rets = None
-            if ret_basis == "collateral" and np.asarray(raw.get("roc")).size > 1:
-                ep_rets = np.asarray(raw["roc"])[1:]
-            figure1(per_ep, out_dir / f"figure1_episode_{raw['seed_offset']}.png", theme=theme,
-                    overlays=overlays, ret_series=ep_rets)
-            figure2(per_ep, out_dir / f"figure2_episode_{raw['seed_offset']}.png", theme=theme)
-            n_ep_figs += 2
-    log.debug("report: %d episode figures written; figure phase %.2fs total",
-              n_ep_figs, time.monotonic() - t_figs)
-    log.debug("report artifacts -> %s", out_dir)
-    agg_net = result["net"]
-    m = metrics(agg_net, periods_per_year=_periods_per_year(cfg), rets=rets, basis=ret_basis,
-                rf_annual=rf_annual, freq=ret_freq)
-    # Each episode is an independent data draw (different seed offset): report
-    # its own risk metrics too so a single pooled Sharpe is not mistaken for a
-    # stable estimate (mean +/- spread across seeds is the honest headline).
-    per_episode = []
-    for raw in episodes:
-        en = np.asarray(raw["net"])
-        em = metrics(en, periods_per_year=_periods_per_year(cfg), rets=None,
-                     basis=ret_basis, rf_annual=rf_annual, freq=ret_freq)
-        em["seed_offset"] = raw["seed_offset"]
-        per_episode.append(em)
-    m["per_episode"] = per_episode
-    log.debug("report metrics: %s", m)
-    return {"out_dir": out_dir, "metrics": m, "n_trades": len(result["ledger"])}
+    run_root = out_dir.parent
+    from dirty_fin_reports.simple.report import run_reporter
+
+    report = run_reporter(
+        run_root,
+        out_dir=run_root,
+        config=_report_config(cfg),
+        theme=theme,
+        overlays=overlays,
+        plausibility=_plausibility(cfg),
+        meta={"data_origin": "policy_rollout"},
+    )
+    verdict = report["plausibility"]
+    log.info("report: %d trades -> verdict=%s (%s) recommendation=%s",
+             report["ledger"]["n_trades"], verdict["status"], verdict["counts"],
+             report["recommendation"]["action"])
+    return {
+        "out_dir": out_dir,
+        "metrics": report["portfolio"],
+        "n_trades": report["ledger"]["n_trades"],
+        "report": report,
+    }

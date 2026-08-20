@@ -71,9 +71,10 @@ Python 3.10+ on Apple Silicon.
 | `mlx`, `mlx-metal` | hot-path tensors + Metal GPU |
 | [`dirty-mkt-data`](https://github.com/nsursock/dirty-mkt-data) | synthetic GBM OHLCV generator (MLX only) |
 | [`dirty-mlx-ml`](https://github.com/nsursock/dirty-mlx-ml) | SB3-shaped PPO / SAC ports |
+| [`dirty-fin-reports`](https://github.com/nsursock/dirty-fin-reports) | reporting engine (metrics, plausibility, PNGs, `report.json`) |
 | `tqdm`, `pyyaml` | progress bars, config |
 | `optuna` | hyperparameter search with pruning |
-| `plotly`, `kaleido`, `tabulate` | reporting figures + tables |
+| `plotly`, `kaleido`, `pandas`, `tabulate` | reporting figures + tables |
 
 ## Install
 
@@ -82,7 +83,8 @@ python3 -m venv venv
 venv/bin/pip install \
   "git+https://github.com/nsursock/dirty-mkt-data.git" \
   "git+https://github.com/nsursock/dirty-mlx-ml.git" \
-  mlx tqdm pyyaml optuna plotly kaleido tabulate
+  "git+https://github.com/nsursock/dirty-fin-reports.git@0.0.1" \
+  mlx tqdm pyyaml optuna plotly kaleido pandas tabulate
 # kaleido PNGs need Chrome-for-Testing:
 venv/bin/plotly_get_chrome
 ```
@@ -90,7 +92,7 @@ venv/bin/plotly_get_chrome
 ## Usage
 
 ```bash
-# smoke: sub-10s train + test
+# smoke: quick train + test (~25 PPO cycles / ~100 SAC samples -> full report)
 venv/bin/python scripts/main.py full --config configs/smoke.yaml
 
 # full training (512 parallel envs)
@@ -116,6 +118,7 @@ Every run writes a timestamped folder `logs/<timestamp>/`:
 ```
 logs/<timestamp>/
 ├── run.log                  # INFO + DEBUG (file only; stdout stays tqdm)
+├── report.json              # metrics, plausibility checks, verdict (dirty-fin-reports)
 ├── training/
 │   ├── manager_ppo.csv      # SB3-style rollout/train/time stats
 │   ├── worker_sac.csv
@@ -126,24 +129,26 @@ logs/<timestamp>/
 └── testing/
     ├── trades.csv           # trade ledger, sorted by close time (+ `episode` col)
     ├── breakdown.txt        # tabulate tables by symbol / exit type
-    ├── figure1.png          # aggregate equity, returns, drawdown, return dist
-    ├── figure2.png          # aggregate leverage, collateral, long/short, exits
-    ├── figure1_episode_<n>  # per-episode figure1 (one per eval.episodes)
-    └── figure2_episode_<n>  # per-episode figure2 (one per eval.episodes)
+    ├── bot-performance-<verdict>.png
+    └── trade-anatomy-<verdict>.png
 ```
+
+The `<verdict>` suffix is one of `plausible`, `flagged` or `implausible`, mirroring
+the run-level aggregate of the reporting engine's plausibility checks.
 
 ## Train / validation / test protocol
 
 Evaluation is split into physically disjoint GBM bundles:
 
 - **`eval.episodes` episodes on seed offsets 1–8** form the *locked final test*.
-  `main.py test` / `full` run one episode per offset (default 1) and report an
-  aggregate `figure1.png` plus a `figure1_episode_<n>.png` per episode. The
-  aggregate equity curve is the average of the per-episode curves, so it is the
-  single hold-out number that matters. Per-symbol and per-episode overlay
-  curves on the aggregate equity plot are on by default and can be dropped via
-  `report.overlays: false`. Test rollouts and the episode loop show tqdm
-  progress (`test episodes` / `test seed+<n>`).
+  `main.py test` / `full` run one episode per offset (default 1) and delegate
+  reporting to `dirty-fin-reports`, which emits `report.json` plus
+  `bot-performance-<verdict>.png` and `trade-anatomy-<verdict>.png`. The
+  portfolio equity curve is the average of the per-account (per-symbol)
+  curves, so it is the single hold-out number that matters. Per-symbol overlay
+  curves on the equity plot can be toggled via `report.overlays`. Test
+  rollouts and the episode loop show tqdm progress
+  (`test episodes` / `test seed+<n>`).
 - **Seed offsets 10–17** are the *validation bundle*. `optim.py` scores every
   Optuna trial on at least two of these seeds (mean ± CI objective) and never
   reads the locked test. The best trial is additionally deflated with a
@@ -155,15 +160,20 @@ Final protocol: tune on the validation bundle → retrain the chosen config →
 config it was trained under via `manifest.json`; a config you did not train
 with is refused unless you pass `--force`.
 
-Risk metrics (Sharpe / Sortino / CAGR / Calmar) are always computed from the
-bar-indexed `net_curve` of `run_test`, annualized by the low-TF bar duration
-(`252 * 1440 / bar_minutes`, e.g. 72,576/yr for 5-minute bars — not a
-hard-coded 252). The portfolio is a nominal ~$1000 book: each `eval` position
-slot (default `max_positions_per_symbol: 1`, configurable) starts at
-`initial_balance` and the portfolio equity is the **mean** of the per-symbol
-account curves (not the sum — summing misstates the book size). The
-per-trade tables in `breakdown.txt` are descriptive only (no `sqrt(n)`
-annualization on trade PnL).
+Risk metrics (Sharpe / Sortino / CAGR / Calmar / Ulcer Index / UPI) are
+computed by the `dirty-fin-reports` reporting engine at the `returns.freq`
+reporting cadence (default `daily` — so a per-bar "160 Sharpe" cannot leak
+into the headline), and are plausibility-checked before being printed. The
+annualization cadence is the low-TF bar duration (`252 * 1440 / bar_minutes`,
+e.g. 72,576/yr for 5-minute bars — not a hard-coded 252). The portfolio is a
+nominal ~$1000 book: each `eval` position slot (default
+`max_positions_per_symbol: 1`, configurable) starts at `initial_balance` and
+the portfolio equity is the **mean** of the per-symbol account curves (not
+the sum — summing misstates the book size). The per-trade tables in
+`breakdown.txt` are descriptive only (no `sqrt(n)` annualization on trade
+PnL). The Optuna search objective (`optim.py`) still scores the native
+bar-cadence Sharpe on the validation bundle; only the final report goes
+through the daily-resampled, plausibility-bounded path.
 
 ## Margin and return modes
 
@@ -191,7 +201,7 @@ per-slot bookkeeping.
 - **collateral** — returns are measured against the deployed collateral (ROC).
   The same +$100 trade on $100 collateral is a +100% return. Flowing through
   the training reward (per-bar ROC, zero while flat), the breakdown "By return"
-  bucket (PnL ÷ trade collateral), the figure1 return panels, and Sharpe /
+  bucket (PnL ÷ trade collateral), the trade-return panels, and Sharpe /
   Sortino. Dollar facts (`final_equity`, drawdown, total_return) stay on the
   equity curve either way.
 
@@ -224,21 +234,16 @@ worker:  { buffer_size, learning_starts, net_arch, ... }  # SAC
 
 ### Report themes
 
-`report.theme` picks the figure palette. `synthwave` / `ghibli` /
-`valorant` come from the `dirty-mkt-data` package; this repo ships its own
-set that wins over any package theme of the same name:
+`report.theme` picks the figure palette, resolved by the reporting engine
+(`dirty-fin-reports`). Available themes:
 
+- `synthwave` — neon purple/magenta dark (default)
+- `ghibli` — warm paper / green / terracotta
+- `valorant` — navy with crimson / teal accents
 - `cyberpunk` — neon-grid dark (cyan / hot pink / electric purple)
-- `nordic_frost` — light, minimalist Scandinavian fintech
 - `tokyo_midnight` — deep indigo + soft blues/lavender
-- `wes_anderson` — warm vintage pastels on cream
+- `nordic_frost` — light, minimalist Scandinavian fintech
 - `brutalist_terminal` — pure black + terminal green/red accents
-- `botanical_dark` — dark forest greens with bronze/clay
-- `solarized_warm` — editorial cream with earth tones
-- `sunset_drive` — amber/coral/magenta twilight gradient
-
-Palettes are defined in `scripts/report.py` (`_LOCAL_THEMES`) and map to the
-figure roles via `_palette()` regardless of light/dark background.
 
 ## Project layout
 
@@ -249,7 +254,8 @@ scripts/
   env.py       # vectorized perpetuals env (fused step)
   agents.py    # PPO Manager + SAC Worker joint trainer
   main.py      # train / test / full
-  report.py    # ledger + figures + ML-health reporting
+  report.py    # policy rollout + ledger + search objective (reporting delegated
+               #   to dirty-fin-reports)
   optim.py     # Optuna multi-tier HP search
   bench.py     # milestone benchmark harness
 utils/

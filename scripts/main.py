@@ -32,7 +32,7 @@ import mlx.core as mx  # noqa: F401  (ensure mlx import before dirty_mlx_ml)
 
 from agents import JointHRL, config_hash
 from config import load
-from report import generate_report, ml_health, resolve_theme
+from report import generate_report, resolve_theme
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -118,8 +118,12 @@ def _train(cfg, run_dir: Path, log, config_path: Path) -> JointHRL:
         raise
     _save(j, train_dir, config_path=config_path)
     theme = resolve_theme((cfg.get("report") or {}).get("theme", "synthwave"))
-    ml_health(train_dir / "manager_ppo.csv", train_dir / "manager_diag.png", "manager", theme=theme)
-    ml_health(train_dir / "worker_sac.csv", train_dir / "worker_diag.png", "worker", theme=theme)
+    from dirty_fin_reports.simple.figures import training_figure
+
+    training_figure(train_dir / "manager_ppo.csv", train_dir / "manager_diag.png",
+                    title="PPO manager health", theme=theme)
+    training_figure(train_dir / "worker_sac.csv", train_dir / "worker_diag.png",
+                    title="SAC worker health", theme=theme)
     log.info("training done: artifacts -> %s", train_dir)
     return j
 
@@ -251,6 +255,18 @@ def _free_training_memory(j: JointHRL) -> None:
     mx.clear_cache()
 
 
+def _report_summary(out: dict) -> str:
+    """One-line summary of a delegated dirty-fin-reports result."""
+    r = out.get("report") or {}
+    p = r.get("plausibility") or {}
+    rec = r.get("recommendation") or {}
+    perf = r.get("performance") or {}
+    rpct = "n/a" if perf.get("return_pct") is None else f"{perf['return_pct']:+.1f}%"
+    return (f"verdict={p.get('status')} ({rpct})  "
+            f"sharpe={out['metrics'].get('sharpe')}  "
+            f"recommend={rec.get('action')}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("mode", choices=["train", "test", "full"])
@@ -293,7 +309,7 @@ def main():
         j.load(ckpt)
         out = _test(cfg, run_dir, j, deterministic=args.deterministic)
         log.info("test complete: %s", out["metrics"])
-        print(f"done -> {out['out_dir']}  {out['metrics']}")
+        print(f"done -> {out['out_dir']}  {_report_summary(out)}")
     elif args.mode == "train":
         _train(cfg, run_dir, log, config_path=src)
         log.info("train complete: artifacts -> %s", run_dir / "training")
@@ -302,7 +318,7 @@ def main():
         j = _train(cfg, run_dir, log, config_path=src)
         out = _test(cfg, run_dir, j, deterministic=args.deterministic)
         log.info("full run complete: %s", out["metrics"])
-        print(f"done -> {out['out_dir']}  {out['metrics']}")
+        print(f"done -> {out['out_dir']}  {_report_summary(out)}")
 
 
 if __name__ == "__main__":

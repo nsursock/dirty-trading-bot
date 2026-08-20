@@ -34,14 +34,7 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 SWEEP = ROOT / "logs" / "sweeps"
 
-_DONE_RE = re.compile(
-    r"-> (?P<out>\S+)  \{\'sharpe\': np\.float64\((?P<sharpe>[-\d.eE+]+)\), "
-    r"\'sortino\': (?:np\.float64\((?P<sortino>[-\d.eE+]+)\)|None), "
-    r"\'max_drawdown\': (?P<mdd>[-\d.eE+]+), "
-    r"\'cagr\': np\.float64\((?P<cagr>[-\d.eE+]+)\), "
-    r"\'final_equity\': (?P<eq>[-\d.eE+]+), "
-    r"\'total_return\': (?P<ret>[-\d.eE+]+), \'return_basis\': \'(?P<basis>\w+)\'.*\}$"
-)
+_OUT_RE = re.compile(r"-> (?P<out>\S+)")
 
 
 def _measured_ar1(phi: float, seed: int) -> tuple[float, float]:
@@ -73,6 +66,17 @@ def _trade_stats(out_dir: Path) -> dict:
     return {"trades": n, "winrate": wins / n, "gross_pnl": float(np.sum(pnl)), "liq": liq}
 
 
+def _load_report(out_dir: Path) -> dict:
+    """Read the reporting engine's ``report.json`` (next to the ``testing/`` dir)."""
+    import json
+
+    p = out_dir.parent / "report.json"
+    if not p.exists():
+        raise RuntimeError(f"no report.json next to {out_dir}")
+    with open(p) as fh:
+        return json.load(fh)
+
+
 def _run_one(phi: float, timesteps: int, template: Path, out: Path, seed: int) -> dict:
     cfg = yaml.safe_load(template.read_text())
     cfg["data"]["ar"] = float(phi)
@@ -87,21 +91,29 @@ def _run_one(phi: float, timesteps: int, template: Path, out: Path, seed: int) -
     )
     stdout = proc.stdout or ""
     stderr = proc.stderr or ""
-    m = _DONE_RE.search(stdout)
+    m = _OUT_RE.search(stdout)
     if m is None:
         raise RuntimeError(
-            f"phi={phi}: no metrics line in output\n{stdout[-1500:]}\n{stderr[-1500:]}"
+            f"phi={phi}: no output dir line in output\n{stdout[-1500:]}\n{stderr[-1500:]}"
         )
-    g = m.groupdict()
-    ts = _trade_stats(Path(g["out"]))
+    out_dir = Path(m.group("out"))
+    pm = _load_report(out_dir)["portfolio"]
+    ts = _trade_stats(out_dir)
+
+    def _f(key):
+        v = pm.get(key)
+        return float("nan") if v is None else float(v)
+
     row = {
         "phi": float(phi),
-        "total_return": float(g["ret"]),
-        "sharpe": float(g["sharpe"]),
-        "sortino": float(g["sortino"]) if g["sortino"] else float("nan"),
-        "max_drawdown": float(g["mdd"]),
-        "final_equity": float(g["eq"]),
-        "cagr": float(g["cagr"]),
+        "total_return": float(pm.get("total_return") or 0.0),
+        "sharpe": _f("sharpe"),
+        "sortino": _f("sortino"),
+        "max_drawdown": float(pm.get("max_drawdown") or 0.0),
+        "ulcer_index": _f("ulcer_index"),
+        "upi": _f("upi"),
+        "final_equity": float(pm.get("final_equity") or 0.0),
+        "cagr": float(pm.get("cagr") or 0.0),
         **ts,
     }
     # The whole sweep runs against ONE locked operating config
@@ -164,14 +176,20 @@ def main() -> None:
         w.writerows(rows)
 
     print(f"sweep done: {csv_path}")
-    print(f"{'phi':>6} {'ar1':>7} {'ret':>9} {'sharpe':>8} {'sortino':>8} {'mdd':>9} {'trades':>7} {'win%':>6} {'gross':>9}")
+    print(f"{'phi':>6} {'ar1':>7} {'ret':>9} {'sharpe':>8} {'sortino':>8} {'mdd':>9} {'ulcer':>8} {'upi':>9} {'trades':>7} {'win%':>6} {'gross':>9}")
     for r in rows:
+        ui = "" if r["ulcer_index"] != r["ulcer_index"] else f"{r['ulcer_index']:8.4f}"
+        upi = "" if r["upi"] != r["upi"] else f"{r['upi']:9.2f}"
         print(f"{r['phi']:+.3f} {r['measured_ar1']:+.3f} {r['total_return']:+.4f} "
               f"{r['sharpe']:8.2f} {r['sortino']:8.2f} {r['max_drawdown']:9.4f} "
-              f"{r['trades']:7d} {100 * r['winrate']:5.1f}% {r['gross_pnl']:+9.1f}")
+              f"{ui} {upi} {r['trades']:7d} {100 * r['winrate']:5.1f}% {r['gross_pnl']:+9.1f}")
 
     if not args.no_plot:
         _plot(csv_path, run_dir / "ar_sweep.png")
+
+
+def _fvals(rows, key):
+    return [float("nan") if not r.get(key) or r.get(key) in ("nan", "") else float(r[key]) for r in rows]
 
 
 def _plot(csv_path: Path, out_png: Path) -> None:
@@ -185,18 +203,25 @@ def _plot(csv_path: Path, out_png: Path) -> None:
     sharpe = [float(r["sharpe"]) for r in rows]
     mdd = [float(r["max_drawdown"]) for r in rows]
     trades = [int(r["trades"]) for r in rows]
+    ulcer = _fvals(rows, "ulcer_index")
+    upi = _fvals(rows, "upi")
 
-    fig = make_subplots(rows=2, cols=2, subplot_titles=(
+    fig = make_subplots(rows=3, cols=2, subplot_titles=(
         "Total return vs \u03c6", "Sharpe vs \u03c6",
+        "Ulcer Index vs \u03c6", "UPI vs \u03c6",
         "Max drawdown vs \u03c6", "Trades vs \u03c6"))
     fig.add_trace(go.Scatter(x=phis, y=ret, mode="lines+markers", name="total_return"), 1, 1)
     fig.add_hline(y=0, line=dict(color="#FF4D6D", width=1, dash="dash"), row=1, col=1)
     fig.add_trace(go.Scatter(x=phis, y=sharpe, mode="lines+markers", name="sharpe"), 1, 2)
     fig.add_hline(y=0, line=dict(color="#FF4D6D", width=1, dash="dash"), row=1, col=2)
-    fig.add_trace(go.Scatter(x=phis, y=mdd, mode="lines+markers", name="max_drawdown"), 2, 1)
-    fig.add_trace(go.Scatter(x=phis, y=trades, mode="lines+markers", name="trades"), 2, 2)
+    fig.add_trace(go.Scatter(x=phis, y=ulcer, mode="lines+markers", name="ulcer_index"), 2, 1)
+    fig.add_hline(y=1, line=dict(color="#FF4D6D", width=1, dash="dash"), row=2, col=1)
+    fig.add_trace(go.Scatter(x=phis, y=upi, mode="lines+markers", name="upi"), 2, 2)
+    fig.add_hline(y=0, line=dict(color="#FF4D6D", width=1, dash="dash"), row=2, col=2)
+    fig.add_trace(go.Scatter(x=phis, y=mdd, mode="lines+markers", name="max_drawdown"), 3, 1)
+    fig.add_trace(go.Scatter(x=phis, y=trades, mode="lines+markers", name="trades"), 3, 2)
     fig.update_xaxes(title_text="\u03c6")
-    fig.update_layout(template="plotly_dark", height=720, showlegend=False)
+    fig.update_layout(template="plotly_dark", height=1080, showlegend=False)
     fig.write_image(str(out_png))
     print(f"sweep plot -> {out_png}")
 

@@ -320,7 +320,6 @@ class JointHRL:
                 mgr_obs = self._mgr_obs(worker_obs, env._steps)
 
                 if sac.num_timesteps >= next_log:
-                    ppo.dump_logs(iteration)
                     sac.dump_logs(iteration)
                     next_log += log_every
 
@@ -342,6 +341,7 @@ class JointHRL:
             mx.clear_cache()
 
             iteration += 1
+            ppo.dump_logs(iteration)
             self.last_ep_rew_mean = float(mx.sum(cycle_win)) / max(n_steps * n_envs, 1)
             if on_iter is not None:
                 on_iter(iteration, self)
@@ -371,7 +371,6 @@ class JointHRL:
 
         pbar.close()
         log.info("training done: total_timesteps=%d", sac.num_timesteps)
-        ppo.dump_logs(iteration)
         sac.dump_logs(iteration)
         ppo.logger.close()
         sac.logger.close()
