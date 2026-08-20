@@ -1,0 +1,137 @@
+# Stage 0 experiment config: GBM + planted AR under locked walk-forward gates.
+#
+# Gates: roadmap/stage0_gates.yaml (frozen — do not edit after starting).
+# Protocol: roadmap/stage0_protocol.md
+#
+# Planted world = noise-calibration point: phi=0.7 with kappa=1.71
+# (ar_noise was sized so phi=0.7 lands in Sharpe~2–5). phi=0.35+same kappa
+# is below that tradable band (measured rho1~0.09).
+#
+# returns.freq=1h: daily cadence only yields ~2–4 marks on these windows, so
+# Ulcer/UPI stay undefined and retention/UPI gates cannot score.
+#
+# Primary training unit = manager PPO updates (not raw env-steps alone).
+# cycle_steps = n_steps * goal_every * n_envs
+# budget = min_manager_updates * cycle_steps (exact full cycles only).
+seed: 42
+
+data:
+  n_symbols: 8
+  n_steps: 5040
+  timeframes:
+    low: 5m
+    high: 4h
+  regime: neutral
+  ar: 0.7
+  ar_noise: 1.71
+
+stage0:
+  mode: expanding
+  n_folds: 4
+  train_bars: 1200
+  test_bars: 720
+  purge_bars: 48
+  embargo_bars: 48
+  seeds: [42, 43, 44]
+
+env:
+  # 8 × 128 = 1024 train envs (both factors power of 2).
+  # cycle = 16 * 8 * 1024 = 131072 env-steps.
+  n_envs_per_symbol: 128
+  lev_min: 2.0
+  lev_max: 20.0
+  open_fee_rate: 0.0003
+  close_fee_rate: 0.0006
+  slippage_bps: 1.0
+  holding_fee_daily: 0.00015
+  bars_per_day: 288
+  liquidation_fee_rate: 0.003
+  liq_threshold_base: 0.90
+  liq_threshold_floor: 0.67
+  liq_threshold_ref_lev: 2.0
+  liq_threshold_hi_lev: 150.0
+  liq_threshold_lo_lev: 1.0
+  liq_mark_impact: 0.005
+  min_collateral: 10.0
+  max_collateral: 10000.0
+  risk_min: 0.01
+  risk_max: 0.05
+  use_take_profit: true
+  use_stop_loss: true
+  take_profit: 0.05
+  stop_loss: 0.03
+  enforce_goal: false
+  initial_balance: 1000.0
+  margin_mode: isolated
+  size_fraction: 1.0
+  side_threshold: 0.2
+  trade_knob: 3.0
+
+reward:
+  mode: smoke
+  drawdown_penalty: 0.0
+  reward_clip: 10.0
+
+norm:
+  norm_obs: true
+  norm_reward: true
+  clip_obs: 10.0
+  clip_reward: 10.0
+  gamma: 0.99
+
+report:
+  theme: synthwave
+  episode_figures: false
+  overlays: false
+
+returns:
+  basis: collateral
+  # 1h marks (~60 on a 720-bar OOS window) so Ulcer/UPI are defined.
+  # daily only yields ~2–3 marks here and leaves UPI null on most folds.
+  freq: 1h
+  rf_annual: 0.045
+
+eval:
+  episodes: 1
+  max_positions_per_symbol: 1
+  deterministic: true
+
+train:
+  # Target: 50 manager PPO rows/fold (learning trajectory, not a snapshot).
+  # cycle = 131072 → budget = 50 * 131072 = 6553600 env-steps.
+  # SAC: log_every=16384 → ~8 mid-cycle dumps + 1/cycle ≈ ~450 worker rows.
+  total_timesteps: 6553600
+  min_manager_updates: 50
+  # completed_only: always write train/time rows; ep_* only when episodes end.
+  # ongoing: always fill ep_* from completed or in-progress accumulators.
+  rollout_log_mode: completed_only
+  log_interval: 1
+  log_every: 16384
+
+hrl:
+  goal_every: 8
+  goal_dim: 3
+
+manager:
+  learning_rate: 0.0003
+  n_steps: 16
+  batch_size: 64
+  n_epochs: 4
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_range: 0.2
+  ent_coef: 0.01
+  vf_coef: 0.5
+  net_arch: [128, 128]
+
+worker:
+  learning_rate: 0.001
+  buffer_size: 1000000
+  learning_starts: 4096
+  batch_size: 256
+  tau: 0.005
+  gamma: 0.99
+  train_freq: 1
+  gradient_steps: 1
+  ent_coef: 0.2
+  net_arch: [256, 256]

@@ -123,6 +123,7 @@ def make_env(cfg, action_space: str, goal_dim: int = 0, bundle=None, trade_knob=
 
 def make_ppo(env, cfg, log_dir=None) -> PPO:
     c = dict(cfg.get("manager", {}))
+    t = dict(cfg.get("train") or {})
     return PPO(
         "MlpPolicy",
         env,
@@ -138,11 +139,13 @@ def make_ppo(env, cfg, log_dir=None) -> PPO:
         seed=cfg.get("seed"),
         log_dir=log_dir,
         policy_kwargs={"net_arch": c.get("net_arch", [64, 64])},
+        rollout_log_mode=t.get("rollout_log_mode", "completed_only"),
     )
 
 
 def make_sac(env, cfg, log_dir=None) -> SAC:
     c = dict(cfg.get("worker", {}))
+    t = dict(cfg.get("train") or {})
     return SAC(
         "MlpPolicy",
         env,
@@ -158,11 +161,54 @@ def make_sac(env, cfg, log_dir=None) -> SAC:
         seed=cfg.get("seed"),
         log_dir=log_dir,
         policy_kwargs={"net_arch": c.get("net_arch", [128, 128])},
+        rollout_log_mode=t.get("rollout_log_mode", "completed_only"),
     )
 
 
 def _one_hot(a, n: int) -> mx.array:
     return mx.equal(mx.arange(n), a[:, None]).astype(mx.float32)
+
+
+def plan_manager_horizon(
+    total_timesteps: int,
+    n_steps: int,
+    goal_every: int,
+    n_envs: int,
+    min_manager_updates: int = 1,
+) -> tuple[int, int, int]:
+    """Choose a manager rollout horizon that fits the env-step budget.
+
+    Returns ``(effective_n_steps, cycle_env_steps, expected_manager_updates)``.
+
+    A joint HRL cycle costs ``n_steps * goal_every * n_envs`` env-steps and
+    yields **one** PPO manager update. If the configured cycle exceeds the
+    budget, a single cycle silently burns the whole run (manager iterations=1).
+    This planner shrinks ``n_steps`` so at least ``min_manager_updates`` full
+    cycles fit, and raises if even ``n_steps=1`` cannot.
+    """
+    total = int(total_timesteps)
+    n_steps = int(n_steps)
+    goal_every = int(goal_every)
+    n_envs = int(n_envs)
+    min_mgr = max(1, int(min_manager_updates))
+    if total < 1 or n_steps < 1 or goal_every < 1 or n_envs < 1:
+        raise ValueError(
+            f"invalid horizon inputs: total={total} n_steps={n_steps} "
+            f"goal_every={goal_every} n_envs={n_envs}"
+        )
+    steps_per_mgr = goal_every * n_envs
+    need = min_mgr * steps_per_mgr
+    if total < need:
+        raise ValueError(
+            f"budget {total} too small for min_manager_updates={min_mgr} "
+            f"with goal_every={goal_every} n_envs={n_envs} "
+            f"(need >= {need} env-steps)"
+        )
+    max_n = total // (min_mgr * steps_per_mgr)
+    eff = min(n_steps, max_n)
+    cycle = eff * steps_per_mgr
+    expected = total // cycle
+    return eff, cycle, expected
 
 
 class JointHRL:
@@ -179,10 +225,10 @@ class JointHRL:
                         low_steps, self.sym_off_high, self.T_hi, self.n_resample)
         return feats
 
-    def __init__(self, cfg, log_dir=None, config_path=None):
+    def __init__(self, cfg, log_dir=None, config_path=None, bundle=None):
         self.cfg = cfg
         self.log_dir = log_dir
-        self.bundle = build_bundle(cfg)
+        self.bundle = build_bundle(cfg) if bundle is None else bundle
         h = dict(cfg.get("hrl", {}))
         self.goal_dim = h.get("goal_dim", 3)
         self.goal_every = h.get("goal_every", 4)
@@ -229,13 +275,28 @@ class JointHRL:
         total = total_timesteps if total_timesteps is not None else cfg.get("train", {}).get(
             "total_timesteps", 4096
         )
+        total = int(total)
         ppo, sac = self.manager, self.worker
         env = self.worker_env
         n_envs = env.num_envs
-        n_steps = ppo.n_steps
         goal_every = self.goal_every
         goal_dim = self.goal_dim
         obs_mgr_dim = self.obs_mgr_dim
+        min_mgr = int(dict(cfg.get("train") or {}).get("min_manager_updates", 1))
+        cfg_n_steps = int(ppo.n_steps)
+        n_steps, cycle_steps, expected_mgr = plan_manager_horizon(
+            total, cfg_n_steps, goal_every, n_envs, min_manager_updates=min_mgr,
+        )
+        if n_steps != cfg_n_steps:
+            log.warning(
+                "manager n_steps %d -> %d so min_manager_updates=%d fit in budget=%d "
+                "(full cycle was %d env-steps)",
+                cfg_n_steps, n_steps, min_mgr, total, cfg_n_steps * goal_every * n_envs,
+            )
+            ppo.n_steps = n_steps
+            ppo.buffer.n_steps = n_steps
+            ppo.batch_size = min(int(ppo.batch_size), n_steps * n_envs)
+            ppo.buffer.reset()
 
         if env._step_fn is None:
             env._build_step()
@@ -252,11 +313,16 @@ class JointHRL:
         mgr_starts = mx.ones((n_envs,))
         log.debug("worker env reset: obs=%s", tuple(worker_obs.shape))
 
-        cycle_steps = n_steps * goal_every * n_envs
         log.info(
-            "joint training: total=%d num_envs=%d n_steps=%d goal_every=%d cycle_steps=%d",
-            total, n_envs, n_steps, goal_every, cycle_steps,
+            "joint training: total=%d num_envs=%d n_steps=%d goal_every=%d "
+            "cycle_steps=%d expected_manager_updates=%d min_manager_updates=%d",
+            total, n_envs, n_steps, goal_every, cycle_steps, expected_mgr, min_mgr,
         )
+        if cycle_steps > total:
+            raise RuntimeError(
+                f"cycle_steps={cycle_steps} still exceeds budget={total}; "
+                "refusing to run a manager-undertraining mega-cycle"
+            )
         pbar = tqdm(total=total, desc="train", unit="env-step")
         iteration = 0
         sac_started = False
@@ -264,7 +330,10 @@ class JointHRL:
         if log_every <= 0:
             log_every = cycle_steps  # fall back to once-per-cycle
         next_log = log_every
-        while sac.num_timesteps < total:
+        # Only schedule full cycles. Checking the budget solely *after* a cycle
+        # previously allowed one mega-cycle to blow past total by 10-20x and
+        # abort with manager iterations=1.
+        while sac.num_timesteps + cycle_steps <= total:
             ppo.buffer.reset()
             cycle_win = mx.zeros((n_envs,))
             obs_l, act_l, rew_l, st_l, val_l, lp_l = [], [], [], [], [], []
@@ -294,6 +363,8 @@ class JointHRL:
 
                 pbar.update(goal_every * n_envs)
                 cycle_win = cycle_win + win
+                if hasattr(ppo, "note_step_rewards"):
+                    ppo.note_step_rewards(win)
                 if (i + 1) % max(n_steps // 10, 1) == 0:
                     log.debug(
                         "window=%d/%d timesteps=%d win_mean=%.6f",
@@ -342,6 +413,8 @@ class JointHRL:
             mx.clear_cache()
 
             iteration += 1
+            # One SAC row per manager cycle (plus any mid-cycle log_every dumps).
+            sac.dump_logs(iteration)
             ppo.dump_logs(iteration)
             self.last_ep_rew_mean = float(mx.sum(cycle_win)) / max(n_steps * n_envs, 1)
             if on_iter is not None:
@@ -371,8 +444,17 @@ class JointHRL:
                 last_ckpt = time.time()
 
         pbar.close()
-        log.info("training done: total_timesteps=%d", sac.num_timesteps)
-        sac.dump_logs(iteration)
+        if iteration < min_mgr:
+            raise RuntimeError(
+                f"manager updates={iteration} < min_manager_updates={min_mgr} "
+                f"(timesteps={sac.num_timesteps}, cycle_steps={cycle_steps}, budget={total})"
+            )
+        log.info(
+            "training done: total_timesteps=%d manager_updates=%d",
+            sac.num_timesteps, iteration,
+        )
+        sac.dump_logs(iteration, force=True)
+        ppo.dump_logs(iteration, force=True)
         ppo.logger.close()
         sac.logger.close()
         return self

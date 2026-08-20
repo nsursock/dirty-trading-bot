@@ -53,15 +53,13 @@ def _one_hot(a, n):
     return mx.equal(mx.arange(n), a[:, None]).astype(mx.float32)
 
 
-def _test_env(cfg, seed_offset=1):
-    import mlx.core as mx
-
+def _eval_env_kwargs(cfg) -> dict:
+    """Env kwargs for evaluation (one slot per symbol by default)."""
     d = dict(cfg.get("data", {}))
     e = dict(cfg.get("env", {}))
     r = dict(cfg.get("reward", {}))
     h = dict(cfg.get("hrl", {}))
     ev = dict(cfg.get("eval", {}))
-    tf = d.get("timeframes", {})
     # Number of independent position-slots per symbol during evaluation
     # (one slot can hold at most one position; default 1 slot => max one
     # open position per symbol).
@@ -74,23 +72,42 @@ def _test_env(cfg, seed_offset=1):
     ak = ev.get("adaptive_knob")
     if ak:
         e["adaptive_knob"] = ak
-    symbols = dict(list(SYMBOLS.items())[: d.get("n_symbols", 4)])
-    seed = cfg.get("seed", 42) + seed_offset
-    bundle = generate(
-        symbols=symbols,
-        n_steps=d.get("n_steps", 400),
-        seed=seed,
-        low_tf=tf.get("low", 5),
-        high_tf=tf.get("high", 240),
-        regime=d.get("regime", "bull"),
-        ar_coef=d.get("ar", 0.0),
-        ar_noise=float(d.get("ar_noise", 0.0)),
+    return e
+
+
+def _test_env(cfg, seed_offset=1, bundle=None):
+    import mlx.core as mx
+
+    d = dict(cfg.get("data", {}))
+    e = _eval_env_kwargs(cfg)
+    tf = d.get("timeframes", {})
+    seed = cfg.get("seed", 42) + int(seed_offset)
+    if bundle is None:
+        symbols = dict(list(SYMBOLS.items())[: d.get("n_symbols", 4)])
+        bundle = generate(
+            symbols=symbols,
+            n_steps=d.get("n_steps", 400),
+            seed=seed,
+            low_tf=tf.get("low", 5),
+            high_tf=tf.get("high", 240),
+            regime=d.get("regime", "bull"),
+            ar_coef=d.get("ar", 0.0),
+            ar_noise=float(d.get("ar_noise", 0.0)),
+        )
+        log.info(
+            "test seed+%d: GBM bundle generated (n_steps=%d, n_resample=%d, low=%s high=%s)",
+            seed_offset, bundle.features.shape[1], bundle.n_resample,
+            tf.get("low", 5), tf.get("high", 240),
+        )
+    else:
+        log.info(
+            "test seed+%d: using provided bundle (n_steps=%d, n_resample=%d)",
+            seed_offset, bundle.features.shape[1], bundle.n_resample,
+        )
+    env = TradingEnv(
+        bundle.features, bundle.ohlcv.closes,
+        highs=bundle.ohlcv.highs, lows=bundle.ohlcv.lows, seed=seed, **e,
     )
-    log.info("test seed+%d: GBM bundle generated (n_steps=%d, n_resample=%d, low=%s high=%s)",
-             seed_offset, bundle.features.shape[1], bundle.n_resample,
-             tf.get("low", 5), tf.get("high", 240))
-    env = TradingEnv(bundle.features, bundle.ohlcv.closes,
-                     highs=bundle.ohlcv.highs, lows=bundle.ohlcv.lows, seed=seed, **e)
     return bundle, env, list(bundle.symbols), e
 
 
@@ -115,7 +132,7 @@ def _mgr_obs_test(high_feats, sym_off_hi, worker_obs, low_steps, T_hi, F, n_resa
 
 
 def run_test(cfg, manager, worker, norm_state=None, seed_offset=1, pbar=None,
-             deterministic=True) -> dict:
+             deterministic=True, bundle=None) -> dict:
     """Joint rollout -> ledger + per-step series.
 
     ``deterministic=True`` drives both tiers greedily (identical, reproducible
@@ -123,17 +140,18 @@ def run_test(cfg, manager, worker, norm_state=None, seed_offset=1, pbar=None,
     actions from the trained policies, so each run exercises the full action
     distribution at the cost of run-to-run variance.
 
-    ``seed_offset`` selects the GBM bundle draw: the locked final test uses
-    ``TEST_SEED_OFFSETS``; validation uses ``VALID_SEED_OFFSETS``. When a
-    ``pbar`` is passed it is shared across episodes (one progress bar for the
-    whole test phase) and this call only advances it; otherwise a per-episode
-    bar is created.
+    ``seed_offset`` selects the GBM bundle draw when ``bundle`` is omitted: the
+    locked final test uses ``TEST_SEED_OFFSETS``; validation uses
+    ``VALID_SEED_OFFSETS``. Pass ``bundle`` for walk-forward / purged path
+    segments (Stage 0). When a ``pbar`` is passed it is shared across episodes
+    (one progress bar for the whole test phase) and this call only advances it;
+    otherwise a per-episode bar is created.
     """
     import mlx.core as mx
     from dirty_mlx_ml.reinforcement import VecNormalize
 
     t_env = time.monotonic()
-    bundle, env, symbols, e = _test_env(cfg, seed_offset=seed_offset)
+    bundle, env, symbols, e = _test_env(cfg, seed_offset=seed_offset, bundle=bundle)
     log.debug("test seed+%d: bundle+env built in %.2fs (n_steps=%d, S=%d, T_hi=%d, n_resample=%d)",
               seed_offset, time.monotonic() - t_env, bundle.features.shape[1], env.n_symbols,
               bundle.high_features.shape[1], bundle.n_resample)

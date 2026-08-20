@@ -1,0 +1,76 @@
+# Stage 0 locked numeric gates.
+#
+# FREEZE RULE: Do not edit these thresholds after a Stage 0 experiment has
+# started. Post-run edits require an explicit new pre-run revision (bump
+# protocol_version, record freeze_commit, and open a new issue note).
+#
+# Source: roadmap/final_plan.md — Stage 0 Numeric Gates
+# Issue: https://github.com/nsursock/dirty-trading-bot/issues/20
+
+protocol_version: "0.1.0"
+stage: 0
+frozen: true
+freeze_date: "2026-08-20"
+# Set to the commit that first landed this file; update only on a deliberate
+# pre-run revision, never after seeing Stage 0 results.
+freeze_commit: null
+
+method: walk_forward_purge_embargo
+cpcv: deferred  # CPCV only if adapted to sequential RL without future leakage
+
+primary_metric: upi
+return_metric: total_return
+
+aggregation:
+  # Each (seed, fold) pair is one fold observation.
+  fold_unit: seed_fold
+  # A seed is "positive" when its median OOS return_metric across folds is > 0.
+  seed_positive: median_oos_return
+
+gates:
+  median_oos_return_positive:
+    metric: total_return
+    scope: oos
+    aggregate: median
+    op: ">"
+    threshold: 0.0
+
+  folds_positive_fraction:
+    metric: total_return
+    scope: oos
+    aggregate: fraction_positive
+    op: ">="
+    threshold: 0.60
+
+  seeds_positive_fraction:
+    metric: total_return
+    scope: oos
+    aggregate: seeds_fraction_positive
+    op: ">="
+    threshold: 0.60
+
+  oos_retention_vs_is:
+    # OOS primary_metric must retain at least this fraction of IS.
+    # Retention = oos / is when is > 0; fails when is <= 0 and oos is not better.
+    metric: upi
+    aggregate: median_retention
+    op: ">="
+    threshold: 0.50
+
+  oos_upi_positive:
+    metric: upi
+    scope: oos
+    aggregate: median
+    op: ">"
+    threshold: 0.0
+
+  no_single_fold_dominance:
+    # max(|fold_return|) / sum(|fold_return|) must stay at or below this share.
+    # NOTE (post-ladder, thresholds unchanged): low discriminating power on the
+    # κ=1.71 φ ladder (~0.16–0.22 on both φ=0.70 PASS and φ=0.50 FAIL). See
+    # final_plan.md near-boundary hierarchy. Any change needs a protocol bump.
+    metric: total_return
+    scope: oos
+    aggregate: max_abs_share
+    op: "<="
+    threshold: 0.50

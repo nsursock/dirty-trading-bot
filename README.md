@@ -58,13 +58,15 @@ max drawdown.
 - [x] Build the core MLX-based environment and HRL trainer
 - [x] Establish a reproducible train / validation / test workflow
 - [x] Add synthetic AR-signal experiments and reporting
-- [ ] Validate the validator on known planted-alpha worlds
+- [ ] Validate the validator on known planted-alpha worlds (Stage 0)
 - [ ] Benchmark ablations: raw HRL vs. alpha-aware variants
 - [ ] Add regime-aware / representation-learning layers
 - [ ] Introduce more realistic frictions and adversarial shifts
 - [ ] Graduate to paper trading only after repeatable out-of-sample evidence
 
 See `roadmap/final_plan.md` for the staged research roadmap.
+Stage 0 locked gates live in `roadmap/stage0_gates.yaml` /
+`roadmap/stage0_protocol.md`.
 
 ## Architecture
 
@@ -147,8 +149,8 @@ Core dependencies:
 python3 -m venv venv
 venv/bin/pip install \
   "git+https://github.com/nsursock/dirty-mkt-data.git" \
-  "git+https://github.com/nsursock/dirty-mlx-ml.git" \
-  "git+https://github.com/nsursock/dirty-fin-reports.git@0.0.2" \
+  "git+https://github.com/nsursock/dirty-mlx-ml.git@v0.0.5" \
+  "git+https://github.com/nsursock/dirty-fin-reports.git@0.0.4" \
   mlx tqdm pyyaml optuna plotly kaleido pandas tabulate
 venv/bin/plotly_get_chrome
 ```
@@ -184,6 +186,11 @@ venv/bin/python utils/inspect_data.py --steps 100
 
 # AR signal-strength sweep
 venv/bin/python utils/sweep_ar.py --config configs/exp_ar.yaml
+
+# Stage 0: walk-forward GBM+AR against locked gates
+caffeinate -dims venv/bin/python scripts/stage0.py \
+  --config configs/stage0_smoke.yaml \
+  --gates roadmap/stage0_gates.yaml
 ```
 
 Each run writes a timestamped folder under `logs/` containing training metrics,

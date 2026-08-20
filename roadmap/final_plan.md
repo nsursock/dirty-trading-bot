@@ -18,6 +18,9 @@ This implies four rules:
 
 ## Stage 0: Validate The Validator
 
+**Status: PASSED / FROZEN.** Do not refine φ further (no 0.525). See
+[`stage0_protocol.md`](./stage0_protocol.md) for immutable metadata.
+
 Before making the market harder, rerun the already-working `GBM + AR` case through the same walk-forward or CPCV-style protocol that will later be trusted on real data.
 
 This must come first because the planted alpha is known to be real. If the evaluation harness cannot confirm a stable edge here, then either the harness is wrong, or it is mismatched to the sequential RL setting.
@@ -26,11 +29,30 @@ Gate:
 
 - The known planted alpha must survive the intended evaluation harness.
 
+**Result:** HRL recovered and exploited planted α under locked gates
+`protocol_version=0.1.0`. Calibration positive control is `φ=0.70` / `κ=1.71`.
+The signal-strength ladder below is **complete**.
+
+```text
+κ = 1.71 fixed
+Stage-1 operating φ     = 0.60   (0.05 above deepest PASS)
+Deepest passing rung    = 0.55
+First failing rung      = 0.50
+Empirical boundary      = (0.50, 0.55]
+```
+
+**Interpretation:** At κ=1.71, recoverability persists through φ=0.55 and breaks
+between φ=0.50 and φ=0.55, with **seed-level agreement** the clearest transition
+signal. φ=0.60 is the Stage 1 operating point — not φ=0.55 (avoid operating on
+the observed boundary).
+
 ### Stage 0 Numeric Gates
+
+**Locked protocol:** [`stage0_protocol.md`](./stage0_protocol.md) + [`stage0_gates.yaml`](./stage0_gates.yaml) (`protocol_version: 0.1.0`).
 
 Before running Stage 0, define the pass criteria up front and do not relax them after seeing results.
 
-Recommended initial thresholds:
+Locked initial thresholds:
 
 - median out-of-sample return across folds must be positive
 - at least 60% of folds must be positive
@@ -41,7 +63,64 @@ Recommended initial thresholds:
 
 These numbers can be revised later, but only before the experiment is run. Once Stage 0 passes, freeze the validator and stop adjusting the validation methodology in response to inconvenient later outcomes.
 
+**Near-boundary evidence hierarchy** (read order when gates disagree / coverage thins):
+
+1. Seed agreement  
+2. Median OOS return  
+3. Fold positivity  
+4. UPI / risk-adjusted diagnostics (only when coverage is high)  
+5. Fold dominance  
+
+**Known gate caveats (do not edit `stage0_gates.yaml`):**
+
+- **Fold dominance — low value in this regime.** Values stayed ~0.16–0.22 on both
+  φ=0.70 PASS and φ=0.50 FAIL. Flagged for a future *pre-run* protocol bump if a
+  later stage needs a discriminating concentration gate; not retired mid-stream.
+- **UPI under partial coverage — survivorship risk.** Retention/OOS-UPI can PASS
+  on the defined subset while breadth gates FAIL (seen at φ=0.50, cov≈50%).
+  Future work (new protocol version): coverage-weighted UPI and/or a stricter
+  evidence floor before UPI counts as supporting evidence. Existing min-coverage
+  guards in dirty-fin-reports 0.0.4 remain; they prevent `None`-driven medians
+  but do not remove conditional-on-survivors bias.
+
+Runner:
+
+```bash
+caffeinate -dims venv/bin/python scripts/stage0.py \
+  --config configs/stage0.yaml \
+  --gates roadmap/stage0_gates.yaml
+```
+
+### Signal-strength ladder (COMPLETE — frozen)
+
+Not roadmap Stage 1. Controlled difficulty probe on the Stage 0 positive
+control: **hold `κ=1.71` fixed, change only `φ`**, reuse locked gates. Do not
+retune `ar_noise` per step. **No further φ steps** (including 0.525).
+
+| Step | φ | κ | Role |
+|------|---|---|------|
+| Stage 0 | 0.70 | 1.71 | Calibration positive control — **PASSED** (12/12, 3/3) |
+| 0-φ.60 | 0.60 | 1.71 | **PASSED** (10/12, 3/3) — Stage 1 operating point |
+| 0-φ.55 | 0.55 | 1.71 | **PASSED** (9/12, 3/3) — safety margin for 0.60 |
+| 0-φ.50 | 0.50 | 1.71 | **FAILED** (6/12, **1/3 seeds**) — regime break |
+| ≤0.40 | ≤0.40 | 1.71 | Skip / known FAIL |
+
+```text
+φ=0.70  PASS  ████████████  3/3 seeds
+φ=0.60  PASS  ██████████░░  3/3 seeds
+φ=0.55  PASS  █████████░░░  3/3 seeds  ← deepest PASS
+φ=0.50  FAIL  ██████░░░░░░  1/3 seeds  ← regime break
+```
+
+Next difficulty axis (later, not Stage 1): raise κ with φ fixed. Do not mix axes.
+
 ## Stage 1: Baseline Synthetic World
+
+**Operating world:** `φ=0.60`, `κ=1.71` (safety margin above deepest PASS 0.55).
+Reuse Stage 0 locked gates / walk-forward protocol. This is **not** live portfolio
+construction — it is the controlled synthetic ablation:
+
+Prerequisite: Stage 0 **PASSED / FROZEN** (ladder complete).
 
 Start from the simplest controlled lab:
 

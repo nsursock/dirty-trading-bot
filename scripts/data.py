@@ -334,3 +334,38 @@ def generate(
         symbols=names, ohlcv=ohlcv, features=feats,
         high_ohlcv=high_ohlcv, high_features=high_features, n_resample=n,
     )
+
+
+def slice_bundle(bundle: DataBundle, start: int, end: int) -> DataBundle:
+    """Causal time slice of a synthetic bundle on low-TF bars ``[start, end)``.
+
+    OHLCV is sliced first; features and the high-TF view are recomputed so the
+    high-TF resample stays aligned to the sliced path (no lookahead from bars
+    outside the window).
+    """
+    start = int(start)
+    end = int(end)
+    T = int(bundle.ohlcv.closes.shape[1])
+    if not (0 <= start < end <= T):
+        raise ValueError(f"invalid slice [{start}, {end}) for T={T}")
+    o = bundle.ohlcv
+    ohlcv = OHLCV(
+        opens=o.opens[:, start:end],
+        highs=o.highs[:, start:end],
+        lows=o.lows[:, start:end],
+        closes=o.closes[:, start:end],
+        vols=o.vols[:, start:end],
+    )
+    feats = _features(ohlcv)
+    n = max(int(bundle.n_resample), 1)
+    high_ohlcv = _resample(ohlcv, n) if n > 1 else ohlcv
+    high_features = _features(high_ohlcv) if n > 1 else feats
+    return DataBundle(
+        symbols=bundle.symbols,
+        ohlcv=ohlcv,
+        features=feats,
+        feature_names=bundle.feature_names,
+        high_ohlcv=high_ohlcv,
+        high_features=high_features,
+        n_resample=n,
+    )
