@@ -14,7 +14,8 @@ venv/
 
 # Run artifacts
 logs/
-reference_runs/  # local symlinks into logs/; canonical paths live in stage0_protocol.md
+# Local symlinks into logs/; canonical paths live in stage0_protocol.md
+reference_runs
 *.log
 
 # Generated data / figures / model checkpoints
