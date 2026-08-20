@@ -1,6 +1,6 @@
 # General
 
-Start every reply with "Yes master!"
+Start every reply with "Yes master!!"
 
 ## Writing Commit Messages
 
@@ -18,6 +18,7 @@ Every python process launch should use venv/bin/python.
 Run python scripts unsandboxed in IDEs.
 Use caffeinate -dims when launching a python process.
 This trading bot should use Apple MLX in the hot path.
+When executing costly python processes, always use tqdm feedback.
 
 # Troubleshooting
 

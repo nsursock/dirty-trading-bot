@@ -84,6 +84,7 @@ def _test_env(cfg, seed_offset=1):
         high_tf=tf.get("high", 240),
         regime=d.get("regime", "bull"),
         ar_coef=d.get("ar", 0.0),
+        ar_noise=float(d.get("ar_noise", 0.0)),
     )
     log.info("test seed+%d: GBM bundle generated (n_steps=%d, n_resample=%d, low=%s high=%s)",
              seed_offset, bundle.features.shape[1], bundle.n_resample,
@@ -572,6 +573,109 @@ def metrics(net, periods_per_year=252, rets=None, basis="account",
     }
 
 
+# Plausibility ceilings aligned with dirty_fin_reports.simple.plausibility defaults.
+_CAGR_CEILING = 5.0
+_ULCER_SUSPICIOUS = 1e-12
+
+_METRIC_UNDEFINED_REASONS = {
+    "sharpe": "insufficient return dispersion at reporting cadence",
+    "sortino": "fewer than two downside periods (or zero downside dispersion) at reporting cadence",
+    "upi": "ulcer_index ~ 0 or non-positive excess mean at reporting cadence",
+    "calmar": "max_drawdown ~ 0 or cagr undefined",
+}
+
+
+def _metric_status(portfolio: dict) -> dict:
+    """Explain whether each ratio is defined, undefined, or erroneous.
+
+    ``None`` in ``portfolio`` means the statistic is *undefined* (e.g. no
+    downside days), not a silent failure. ``metric_status`` makes that explicit
+    in ``report.json`` so readers can tell ``null`` apart from a broken run.
+    """
+    status = {}
+    for key in ("sharpe", "sortino", "upi", "cagr", "ulcer_index", "calmar"):
+        val = portfolio.get(key)
+        if val is None:
+            status[key] = {
+                "state": "undefined",
+                "reason": _METRIC_UNDEFINED_REASONS.get(key, "not computable at this cadence"),
+            }
+            continue
+        try:
+            fv = float(val)
+        except (TypeError, ValueError):
+            status[key] = {"state": "error", "reason": "non-numeric value"}
+            continue
+        if not math.isfinite(fv):
+            status[key] = {"state": "error", "reason": "non-finite value"}
+            continue
+        entry = {"state": "defined"}
+        if key == "ulcer_index" and fv <= _ULCER_SUSPICIOUS:
+            entry["note"] = "zero drawdown at reporting cadence — ratio metrics may be undefined"
+        if key == "cagr" and abs(fv) > _CAGR_CEILING:
+            entry["flag"] = "out_of_bounds"
+        status[key] = entry
+    return status
+
+
+def _patch_plausibility_checks(report: dict) -> None:
+    """Tighten plausibility: flag suspicious zero-ulcer and extreme CAGR."""
+    checks = report.setdefault("plausibility_checks", [])
+    portfolio = report.get("portfolio") or {}
+
+    ui = portfolio.get("ulcer_index")
+    if ui is not None:
+        try:
+            ui_f = float(ui)
+        except (TypeError, ValueError):
+            ui_f = None
+        if ui_f is not None and ui_f <= _ULCER_SUSPICIOUS:
+            for c in checks:
+                if c.get("metric") == "ulcer_index":
+                    c.update({
+                        "ok": False,
+                        "severity": "low",
+                        "reason": (
+                            "ulcer_index=0 (no drawdown at reporting cadence — suspicious)"
+                        ),
+                    })
+                    break
+            else:
+                checks.append({
+                    "metric": "ulcer_index",
+                    "ok": False,
+                    "severity": "low",
+                    "actual": ui_f,
+                    "reason": (
+                        "ulcer_index=0 (no drawdown at reporting cadence — suspicious)"
+                    ),
+                })
+
+    from dirty_fin_reports.simple.plausibility import Bound, aggregate
+
+    bounds = [
+        Bound(
+            c["metric"],
+            None,
+            None,
+            c.get("actual"),
+            bool(c.get("ok", True)),
+            str(c.get("severity", "ok")),
+            str(c.get("reason", "")),
+        )
+        for c in checks
+    ]
+    report["plausibility"] = aggregate(bounds)
+
+
+def enrich_report(report: dict) -> dict:
+    """Post-process a dirty-fin-reports bundle before persisting ``report.json``."""
+    portfolio = report.setdefault("portfolio", {})
+    portfolio["metric_status"] = _metric_status(portfolio)
+    _patch_plausibility_checks(report)
+    return report
+
+
 def validate(cfg, manager, worker, n_seeds=2, norm_state=None, deterministic=True) -> dict:
     """Score a trained model on the held-out *validation* bundle.
 
@@ -890,7 +994,7 @@ def generate_report(cfg, manager, worker, out_dir, norm_state=None, deterministi
     write_ledger(ledger, out_dir / "trades.csv")
 
     run_root = out_dir.parent
-    from dirty_fin_reports.simple.report import run_reporter
+    from dirty_fin_reports.simple.report import run_reporter, write_report
 
     report = run_reporter(
         run_root,
@@ -901,6 +1005,8 @@ def generate_report(cfg, manager, worker, out_dir, norm_state=None, deterministi
         plausibility=_plausibility(cfg),
         meta={"data_origin": "policy_rollout"},
     )
+    report = enrich_report(report)
+    write_report(report, run_root / "report.json")
     verdict = report["plausibility"]
     log.info("report: %d trades -> verdict=%s (%s) recommendation=%s",
              report["ledger"]["n_trades"], verdict["status"], verdict["counts"],

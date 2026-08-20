@@ -96,6 +96,37 @@ def test_diagnostics_exposes_ar1():
     assert abs(float(diag["ar1"][0]) - 0.5) < 0.06
 
 
+def test_ar_noise_reduces_measured_autocorr():
+    """Extra iid shocks dilute lag-1 autocorr while keeping phi in the AR recursion."""
+    b0 = generate(symbols={"BTC": SYMBOLS["BTC"]}, n_steps=8000, seed=99,
+                  low_tf=5, high_tf=240, regime="neutral", ar_coef=0.7, ar_noise=0.0)
+    b1 = generate(symbols={"BTC": SYMBOLS["BTC"]}, n_steps=8000, seed=99,
+                  low_tf=5, high_tf=240, regime="neutral", ar_coef=0.7, ar_noise=2.0)
+    r0 = np.diff(np.log(np.asarray(b0.ohlcv.closes)), axis=1)
+    r1 = np.diff(np.log(np.asarray(b1.ohlcv.closes)), axis=1)
+    rho0 = float(np.mean(_autocorr1(r0)))
+    rho1 = float(np.mean(_autocorr1(r1)))
+    assert rho0 > 0.55
+    assert rho1 < rho0
+    assert rho1 < 0.35
+
+
+def test_ar_noise_is_constant_across_phi():
+    """Fixed kappa: measured lag-1 still rises with phi (unlike kappa ∝ |phi|)."""
+    rhos = []
+    for phi in (0.2, 0.35, 0.5, 0.7):
+        b = generate(symbols={"BTC": SYMBOLS["BTC"]}, n_steps=12000, seed=99,
+                     low_tf=5, high_tf=240, regime="neutral",
+                     ar_coef=phi, ar_noise=1.71)
+        r = np.diff(np.log(np.asarray(b.ohlcv.closes)), axis=1)
+        rhos.append(float(np.mean(_autocorr1(r))))
+    assert rhos[0] < rhos[1] < rhos[2] < rhos[3]
+    # Diluted vs raw phi, but still ordered: rho ≈ phi / (1 + 1.71**2)
+    for phi, rho in zip((0.2, 0.35, 0.5, 0.7), rhos):
+        pred = phi / (1.0 + 1.71 ** 2)
+        assert abs(rho - pred) < 0.04
+
+
 def test_generate_ar_coef_flows_into_bundle():
     """ar_coef > 0 changes the data: lag-1 autocorr should be positive."""
     b = generate(symbols={"BTC": SYMBOLS["BTC"]}, n_steps=2500, seed=11,

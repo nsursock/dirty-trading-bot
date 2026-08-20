@@ -92,6 +92,7 @@ def build_bundle(cfg):
         high_tf=tf.get("high", 240),
         regime=d.get("regime", "bull"),
         ar_coef=d.get("ar", 0.0),
+        ar_noise=float(d.get("ar_noise", 0.0)),
     )
 
 

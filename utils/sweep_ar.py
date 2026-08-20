@@ -30,6 +30,7 @@ from pathlib import Path
 import mlx.core as mx
 import numpy as np
 import yaml
+from tqdm import tqdm
 
 ROOT = Path(__file__).resolve().parents[1]
 SWEEP = ROOT / "logs" / "sweeps"
@@ -37,7 +38,7 @@ SWEEP = ROOT / "logs" / "sweeps"
 _OUT_RE = re.compile(r"-> (?P<out>\S+)")
 
 
-def _measured_ar1(phi: float, seed: int) -> tuple[float, float]:
+def _measured_ar1(phi: float, seed: int, ar_noise: float = 0.0) -> tuple[float, float]:
     """Lag-1 autocorr + per-step return std from the same bundle path as training."""
     sys.path.insert(0, str(ROOT / "scripts"))
     from data import generate
@@ -46,6 +47,7 @@ def _measured_ar1(phi: float, seed: int) -> tuple[float, float]:
         symbols={"BTC": (0.30, 0.60, 60_000.0)},
         n_steps=20000, seed=seed, low_tf=5, high_tf=5, regime="neutral",
         ar_coef=phi,
+        ar_noise=float(ar_noise),
     )
     r = np.log(np.asarray(b.ohlcv.closes))
     r = np.diff(r, axis=1)
@@ -80,21 +82,31 @@ def _load_report(out_dir: Path) -> dict:
 def _run_one(phi: float, timesteps: int, template: Path, out: Path, seed: int) -> dict:
     cfg = yaml.safe_load(template.read_text())
     cfg["data"]["ar"] = float(phi)
+    cfg["seed"] = int(seed)
     cfg["eval"]["deterministic"] = True
-    cfg_path = out / f"phi_{phi:+.2f}.yaml"
+    tag = f"phi_{phi:+.2f}_seed{seed}"
+    cfg_path = out / f"{tag}.yaml"
     cfg_path.write_text(yaml.safe_dump(cfg, sort_keys=False))
 
-    proc = subprocess.run(
+    log_path = out / f"{tag}.log"
+    # stderr inherited so main.py train/test tqdm bars render live; stdout
+    # captured for the ``done ->`` line (pipe deadlock avoided — no capture on stderr).
+    proc = subprocess.Popen(
         [sys.executable, "scripts/main.py", "full", "--config", str(cfg_path),
          "--timesteps", str(timesteps)],
-        cwd=ROOT, capture_output=True, text=True,
+        cwd=ROOT, stdout=subprocess.PIPE, stderr=None, text=True,
     )
-    stdout = proc.stdout or ""
-    stderr = proc.stderr or ""
-    m = _OUT_RE.search(stdout)
+    stdout, _ = proc.communicate()
+    log_path.write_text(stdout or "")
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"phi={phi}: main.py exited {proc.returncode}\n{(stdout or '')[-1500:]}"
+        )
+    log_text = stdout or ""
+    m = _OUT_RE.search(log_text)
     if m is None:
         raise RuntimeError(
-            f"phi={phi}: no output dir line in output\n{stdout[-1500:]}\n{stderr[-1500:]}"
+            f"phi={phi}: no output dir line in {log_path}\n{log_text[-1500:]}"
         )
     out_dir = Path(m.group("out"))
     pm = _load_report(out_dir)["portfolio"]
@@ -106,6 +118,7 @@ def _run_one(phi: float, timesteps: int, template: Path, out: Path, seed: int) -
 
     row = {
         "phi": float(phi),
+        "seed": int(seed),
         "total_return": float(pm.get("total_return") or 0.0),
         "sharpe": _f("sharpe"),
         "sortino": _f("sortino"),
@@ -131,44 +144,61 @@ def main() -> None:
     ap.add_argument("--config", default=str(ROOT / "configs" / "exp_ar.yaml"))
     ap.add_argument("--timesteps", type=int, default=2_000_000)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--seeds", default=None,
+                    help="comma-separated seeds (overrides --seed; one run per seed)")
     ap.add_argument("--no-plot", action="store_true")
     args = ap.parse_args()
 
     phis = [float(x) for x in args.phis.split(",") if x.strip()]
+    seeds = ([int(x) for x in args.seeds.split(",") if x.strip()]
+             if args.seeds else [int(args.seed)])
     template = Path(args.config)
     if not template.exists():
         raise SystemExit(f"template config not found: {template}")
+    template_cfg = yaml.safe_load(template.read_text())
+    ar_noise = float((template_cfg.get("data") or {}).get("ar_noise", 0.0))
 
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
     run_dir = SWEEP / f"ar_sweep_{ts}"
     run_dir.mkdir(parents=True, exist_ok=True)
     csv_path = run_dir / "ar_sweep.csv"
 
+    jobs = [(phi, seed) for phi in phis for seed in seeds]
     print(
-        f"sweep: phi varies, operating config LOCKED from {template.name} "
-        f"(min_hold_bars + side_threshold fixed). Rows are 'capture at phi under "
-        f"fixed config', NOT per-phi optimal configs.",
+        f"sweep: operating config LOCKED from {template.name} "
+        f"(min_hold_bars + side_threshold fixed, ar_noise={ar_noise:.2f}). "
+        f"{len(phis)} phi × {len(seeds)} seed = {len(jobs)} runs. "
+        f"Rows are 'capture at phi under fixed config', NOT per-phi optimal configs.",
         flush=True,
     )
 
     rows = []
-    t0 = time.monotonic()
-    for phi in phis:
+    sweep_bar = tqdm(jobs, desc="AR sweep", unit="run", colour="cyan", leave=True)
+    for phi, seed in sweep_bar:
         t1 = time.monotonic()
-        rho1, per_std = _measured_ar1(phi, args.seed)
-        row = _run_one(phi, args.timesteps, template, run_dir, args.seed)
+        sweep_bar.set_postfix_str(f"phi={phi:+.2f} seed={seed} measuring ar1…", refresh=True)
+        rho1, per_std = _measured_ar1(phi, seed, ar_noise)
+        sweep_bar.set_postfix_str(
+            f"phi={phi:+.2f} seed={seed} ar1={rho1:+.3f} training…", refresh=True,
+        )
+        row = _run_one(phi, args.timesteps, template, run_dir, seed)
         row["measured_ar1"] = rho1
         row["per_step_std"] = per_std
         rows.append(row)
         elapsed = time.monotonic() - t1
-        remaining = len(phis) - len(rows)
+        remaining = len(jobs) - len(rows)
         eta = elapsed * remaining if remaining > 0 else 0.0
-        print(
-            f"phi={phi:+.2f} ar1={rho1:+.3f} ret={row['total_return']:+.4f} "
+        sweep_bar.set_postfix_str(
+            f"phi={phi:+.2f} seed={seed} ret={row['total_return']:+.3f} "
+            f"sh={row['sharpe']:+.1f} ~{eta:.0f}s left",
+            refresh=True,
+        )
+        tqdm.write(
+            f"phi={phi:+.2f} seed={seed} ar1={rho1:+.3f} ret={row['total_return']:+.4f} "
             f"sharpe={row['sharpe']:+.2f} trades={row['trades']} "
             f"({elapsed:.0f}s this run, ~{eta:.0f}s remaining)",
-            flush=True,
         )
+    sweep_bar.close()
 
     with open(csv_path, "w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
@@ -176,13 +206,19 @@ def main() -> None:
         w.writerows(rows)
 
     print(f"sweep done: {csv_path}")
-    print(f"{'phi':>6} {'ar1':>7} {'ret':>9} {'sharpe':>8} {'sortino':>8} {'mdd':>9} {'ulcer':>8} {'upi':>9} {'trades':>7} {'win%':>6} {'gross':>9}")
+    print(f"{'phi':>6} {'seed':>5} {'ar1':>7} {'ret':>9} {'sharpe':>8} {'sortino':>8} {'mdd':>9} {'ulcer':>8} {'upi':>9} {'trades':>7} {'win%':>6} {'gross':>9}")
     for r in rows:
         ui = "" if r["ulcer_index"] != r["ulcer_index"] else f"{r['ulcer_index']:8.4f}"
         upi = "" if r["upi"] != r["upi"] else f"{r['upi']:9.2f}"
-        print(f"{r['phi']:+.3f} {r['measured_ar1']:+.3f} {r['total_return']:+.4f} "
+        print(f"{r['phi']:+.3f} {r['seed']:5d} {r['measured_ar1']:+.3f} {r['total_return']:+.4f} "
               f"{r['sharpe']:8.2f} {r['sortino']:8.2f} {r['max_drawdown']:9.4f} "
               f"{ui} {upi} {r['trades']:7d} {100 * r['winrate']:5.1f}% {r['gross_pnl']:+9.1f}")
+    if len(seeds) > 1 and len(phis) == 1:
+        sh = [r["sharpe"] for r in rows]
+        ret = [r["total_return"] for r in rows]
+        print(f"seed summary: n={len(rows)}  sharpe mean={np.nanmean(sh):+.2f} "
+              f"std={np.nanstd(sh):.2f}  ret mean={np.nanmean(ret):+.4f} "
+              f"std={np.nanstd(ret):.4f}")
 
     if not args.no_plot:
         _plot(csv_path, run_dir / "ar_sweep.png")
@@ -198,6 +234,10 @@ def _plot(csv_path: Path, out_png: Path) -> None:
 
     rows = list(csv.DictReader(open(csv_path)))
     phis = [float(r["phi"]) for r in rows]
+    seeds = [int(r["seed"]) if r.get("seed") not in (None, "") else 0 for r in rows]
+    vs_seed = len(set(phis)) == 1 and len(set(seeds)) > 1
+    xs = seeds if vs_seed else phis
+    xlab = "seed" if vs_seed else "\u03c6"
     ar1 = [float(r["measured_ar1"]) for r in rows]
     ret = [float(r["total_return"]) for r in rows]
     sharpe = [float(r["sharpe"]) for r in rows]
@@ -207,20 +247,20 @@ def _plot(csv_path: Path, out_png: Path) -> None:
     upi = _fvals(rows, "upi")
 
     fig = make_subplots(rows=3, cols=2, subplot_titles=(
-        "Total return vs \u03c6", "Sharpe vs \u03c6",
-        "Ulcer Index vs \u03c6", "UPI vs \u03c6",
-        "Max drawdown vs \u03c6", "Trades vs \u03c6"))
-    fig.add_trace(go.Scatter(x=phis, y=ret, mode="lines+markers", name="total_return"), 1, 1)
+        f"Total return vs {xlab}", f"Sharpe vs {xlab}",
+        f"Ulcer Index vs {xlab}", f"UPI vs {xlab}",
+        f"Max drawdown vs {xlab}", f"Trades vs {xlab}"))
+    fig.add_trace(go.Scatter(x=xs, y=ret, mode="lines+markers", name="total_return"), 1, 1)
     fig.add_hline(y=0, line=dict(color="#FF4D6D", width=1, dash="dash"), row=1, col=1)
-    fig.add_trace(go.Scatter(x=phis, y=sharpe, mode="lines+markers", name="sharpe"), 1, 2)
+    fig.add_trace(go.Scatter(x=xs, y=sharpe, mode="lines+markers", name="sharpe"), 1, 2)
     fig.add_hline(y=0, line=dict(color="#FF4D6D", width=1, dash="dash"), row=1, col=2)
-    fig.add_trace(go.Scatter(x=phis, y=ulcer, mode="lines+markers", name="ulcer_index"), 2, 1)
+    fig.add_trace(go.Scatter(x=xs, y=ulcer, mode="lines+markers", name="ulcer_index"), 2, 1)
     fig.add_hline(y=1, line=dict(color="#FF4D6D", width=1, dash="dash"), row=2, col=1)
-    fig.add_trace(go.Scatter(x=phis, y=upi, mode="lines+markers", name="upi"), 2, 2)
+    fig.add_trace(go.Scatter(x=xs, y=upi, mode="lines+markers", name="upi"), 2, 2)
     fig.add_hline(y=0, line=dict(color="#FF4D6D", width=1, dash="dash"), row=2, col=2)
-    fig.add_trace(go.Scatter(x=phis, y=mdd, mode="lines+markers", name="max_drawdown"), 3, 1)
-    fig.add_trace(go.Scatter(x=phis, y=trades, mode="lines+markers", name="trades"), 3, 2)
-    fig.update_xaxes(title_text="\u03c6")
+    fig.add_trace(go.Scatter(x=xs, y=mdd, mode="lines+markers", name="max_drawdown"), 3, 1)
+    fig.add_trace(go.Scatter(x=xs, y=trades, mode="lines+markers", name="trades"), 3, 2)
+    fig.update_xaxes(title_text=xlab)
     fig.update_layout(template="plotly_dark", height=1080, showlegend=False)
     fig.write_image(str(out_png))
     print(f"sweep plot -> {out_png}")

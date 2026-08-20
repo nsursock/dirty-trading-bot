@@ -10,6 +10,9 @@ data:
     high: 4h
   regime: neutral
   ar: 0.35
+  # iid shock scale (sigma*sqrt(dt) units), constant across phi.
+  # Calibrated so phi=0.7 lands near Sharpe ~4 under the locked config.
+  ar_noise: 1.71
 
 env:
   n_envs_per_symbol: 24

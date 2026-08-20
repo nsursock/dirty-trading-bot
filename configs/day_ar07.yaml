@@ -7,6 +7,7 @@ data:
     high: 4h
   regime: mix
   ar: 0.7
+  ar_noise: 1.71
 env:
   n_envs_per_symbol: 256
   lev_min: 20.0

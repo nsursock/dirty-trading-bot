@@ -21,7 +21,7 @@ import mlx.core as mx
 from dirty_mkt_data import Generator
 from dirty_mkt_data.core.argbm import ARGBM
 from dirty_mkt_data.eval.rolling import rolling_mean
-from dirty_mkt_data.viz.ohlcv import OHLCV, from_dataset
+from dirty_mkt_data.viz.ohlcv import OHLCV, build_ohlcv, from_dataset
 from tqdm import tqdm
 
 log = logging.getLogger("trading")
@@ -156,6 +156,10 @@ def _ewm(x: mx.array, alpha: float) -> mx.array:
     for t in range(1, x.shape[1]):
         y = alpha * x[:, t] + (1.0 - alpha) * y
         cols.append(y)
+        # Periodic eval so a T=17k Python loop does not exceed Metal's
+        # unfused-graph resource cap (499000).
+        if t % 32 == 0:
+            mx.eval(y)
     return mx.stack(cols, axis=1)
 
 
@@ -218,6 +222,28 @@ def _features(o: OHLCV) -> mx.array:
     )
 
 
+def _apply_ar_noise(
+    returns: mx.array,
+    sigma: float,
+    dt: float,
+    ar_noise: float,
+    key,
+) -> mx.array:
+    """Add iid Gaussian shock on top of AR(1) log-returns.
+
+    ``ar_noise`` scales extra innovation in units of ``sigma * sqrt(dt)`` — the
+    same per-step noise scale as GBM/ARGB M. ``0`` leaves the process unchanged;
+    larger values dilute momentum tradability while keeping the injected ``phi``
+    in the underlying AR recursion (measured lag-1 autocorr falls smoothly as
+    noise rises).
+    """
+    if ar_noise <= 0:
+        return returns
+    scale = float(ar_noise) * sigma * (dt ** 0.5)
+    eta = mx.random.normal(returns.shape, key=key) * scale
+    return returns + eta
+
+
 def generate(
     symbols: dict[str, tuple[float, float, float]] | None = None,
     n_steps: int = 2520,
@@ -228,6 +254,7 @@ def generate(
     regime: str = "bull",
     dt: float | None = None,
     ar_coef: float = 0.0,
+    ar_noise: float = 0.0,
 ) -> DataBundle:
     params = SYMBOLS if symbols is None else symbols
     names = tuple(params)
@@ -256,6 +283,8 @@ def generate(
     )
     if ar_coef:
         log.info("data: injecting AR(1) alpha phi=%.2f into GBM log-returns", ar_coef)
+    if ar_noise > 0:
+        log.info("data: AR observation noise kappa=%.2f (constant across phi)", ar_noise)
 
     arrays = {k: [] for k in ("opens", "highs", "lows", "closes", "vols")}
     t_gen = time.monotonic()
@@ -269,7 +298,17 @@ def generate(
         ds = Generator(model, seed=seed).sample(
             n_steps, n_paths=1, run_id=i
         )
-        o = from_dataset(ds, sigma=sigma, dt=dt, base_volume=base_volume, key=keys[i])
+        rets = ds.returns
+        if ar_noise > 0:
+            noise_key = mx.random.key(seed + 1_000_003 + i * 997)
+            rets = _apply_ar_noise(rets, sigma, dt, ar_noise, noise_key)
+            prices = s0 * mx.exp(mx.cumsum(rets, axis=1))
+            o = build_ohlcv(
+                rets, prices=prices, s0=s0, sigma=sigma, dt=dt,
+                base_volume=base_volume, key=keys[i],
+            )
+        else:
+            o = from_dataset(ds, sigma=sigma, dt=dt, base_volume=base_volume, key=keys[i])
         arrays["opens"].append(o.opens)
         arrays["highs"].append(o.highs)
         arrays["lows"].append(o.lows)
