@@ -1,0 +1,102 @@
+seed: 42
+data:
+  n_symbols: 8
+  n_steps: 360
+  timeframes:
+    low: 4h
+    high: 1d
+  regime: mix
+  ar: 0.7
+env:
+  n_envs_per_symbol: 256
+  lev_min: 20.0
+  lev_max: 20.0
+  open_fee_rate: 0.0003
+  close_fee_rate: 0.0006
+  slippage_bps: 1.0
+  holding_fee_daily: 0.00015
+  bars_per_day: 6
+  liquidation_fee_rate: 0.003
+  liq_threshold_base: 0.9
+  liq_threshold_floor: 0.67
+  liq_threshold_ref_lev: 2.0
+  liq_threshold_hi_lev: 150.0
+  liq_threshold_lo_lev: 1.0
+  liq_mark_impact: 0.005
+  min_collateral: 10.0
+  max_collateral: 10000.0
+  risk_min: 0.01
+  risk_max: 0.05
+  use_take_profit: true
+  use_stop_loss: true
+  take_profit: 0.2
+  stop_loss: 0.1
+  enforce_goal: false
+  initial_balance: 1000.0
+  margin_mode: isolated
+  size_fraction: 1.0
+  side_threshold: 0.2
+  trade_knob: 8.5
+reward:
+  mode: normal
+  drawdown_penalty: 1.0
+  reward_clip: 10.0
+norm:
+  norm_obs: true
+  norm_reward: true
+  clip_obs: 10.0
+  clip_reward: 10.0
+  gamma: 0.99
+report:
+  theme: synthwave
+  episode_figures: false
+  overlays: false
+returns:
+  basis: collateral
+  freq: daily
+  rf_annual: 0.045
+eval:
+  episodes: 8
+  max_positions_per_symbol: 1
+  deterministic: true
+  adaptive_knob:
+    active: true
+    window_days: 3
+    occupancy_target: 0.15
+    tolerance: 0.02
+    p_gain: 1.5
+    min_mult: 0.01
+    max_mult: 100.0
+train:
+  total_timesteps: 20000000
+  log_interval: 1
+  log_every: 200000
+hrl:
+  goal_every: 8
+  goal_dim: 3
+manager:
+  learning_rate: 0.0003
+  n_steps: 256
+  batch_size: 64
+  n_epochs: 4
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_range: 0.2
+  ent_coef: 0.01
+  vf_coef: 0.5
+  net_arch:
+  - 128
+  - 128
+worker:
+  learning_rate: 0.001
+  buffer_size: 1000000
+  learning_starts: 4096
+  batch_size: 256
+  tau: 0.005
+  gamma: 0.99
+  train_freq: 1
+  gradient_steps: 1
+  ent_coef: 0.2
+  net_arch:
+  - 256
+  - 256
