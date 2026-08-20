@@ -148,7 +148,7 @@ python3 -m venv venv
 venv/bin/pip install \
   "git+https://github.com/nsursock/dirty-mkt-data.git" \
   "git+https://github.com/nsursock/dirty-mlx-ml.git" \
-  "git+https://github.com/nsursock/dirty-fin-reports.git@0.0.1" \
+  "git+https://github.com/nsursock/dirty-fin-reports.git@0.0.2" \
   mlx tqdm pyyaml optuna plotly kaleido pandas tabulate
 venv/bin/plotly_get_chrome
 ```

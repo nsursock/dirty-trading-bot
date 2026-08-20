@@ -529,10 +529,15 @@ class TradingEnv:
                 reward = log_ret
             reward = mx.clip(reward, -reward_clip, reward_clip)
 
+            # Isolated (and cross) liquidation forfeits the position / locked
+            # collateral into balance but must NOT end the episode. Ending on
+            # `liq` auto-resets the account to initial_balance on the next step
+            # and wipes surviving cash. Episodes end on true bankruptcy or
+            # data truncation only (Ref #9).
             bankrupt = eq_end < min_col
             trunc_data = t_next >= (T - 1)
-            truncated = trunc_data | bankrupt
-            terminated = liq
+            truncated = trunc_data
+            terminated = bankrupt
             done = terminated | truncated
 
             state2 = mx.stack([balance, q, entry, collateral, peak2], axis=1)
