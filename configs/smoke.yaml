@@ -76,9 +76,14 @@ eval:
     max_mult: 100.0
 
 train:
+  # Dense enough for noise+trend curves (not a handful of coarse dumps).
+  # log_every=64 → ~200 worker rows over 12.8k env-steps.
+  # ongoing: fill ep_* every dump from in-progress episode stats.
   total_timesteps: 12800
+  min_manager_updates: 20
+  rollout_log_mode: ongoing
   log_interval: 1
-  log_every: 128
+  log_every: 64
 
 hrl:
   goal_every: 4

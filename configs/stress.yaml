@@ -75,9 +75,16 @@ eval:
     max_mult: 100.0
 
 train:
+  # 100M env-steps was previously log_every=1e6 → ~100 worker / ~12 manager
+  # rows (steppy, not noise+trend). Align with Stage 0 curve density:
+  #   min_manager_updates=50 → planner shrinks n_steps so ~50 PPO rows
+  #   log_every=131072 → ~750 SAC mid-cycle dumps
+  #   ongoing → ep_* filled every dump (not only on episode end)
   total_timesteps: 100000000
+  min_manager_updates: 50
+  rollout_log_mode: ongoing
   log_interval: 1
-  log_every: 1000000
+  log_every: 131072
 
 hrl:
   goal_every: 8
